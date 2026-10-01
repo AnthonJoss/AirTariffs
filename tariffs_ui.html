@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Subir tarifas aéreas</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:24px;max-width:1150px}
+fieldset{margin:12px 0;border:1px solid #ccc;padding:12px}label{display:inline-block;margin:4px 12px 4px 0}
+input,select{padding:4px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:3px 4px;text-align:left}
+td input{width:70px}td input.code{width:50px;text-transform:uppercase}.bad{background:#ffd6d6}
+button{padding:8px 16px;margin:8px 8px 8px 0}.err{color:#b00020}.ok{color:#0a7a2f}
+.card{border:2px solid #888;border-radius:8px;padding:12px 16px;margin:18px 0}.card.done{border-color:#0a7a2f;opacity:.75}
+.card h3{margin:0 0 6px}.status{white-space:pre-wrap;margin:6px 0}
+</style></head><body>
+<h2>Subir tarifas aéreas (PDF)</h2>
+<input type="file" id="file" accept=".pdf" multiple><button id="go">Analizar PDFs</button>
+<button id="insertAll" hidden>Insertar todos los PDFs pendientes</button>
+<div id="msg" class="status"></div>
+<div id="cards"></div>
+
+<template id="tpl">
+<div class="card">
+  <h3></h3><div class="status"></div>
+  <div class="review">
+  <fieldset><legend>Datos generales (se aplican a todas las filas de este PDF)</legend>
+    <label>Proveedor <input class="provider_q" placeholder="buscar..."> <select class="provider_id"></select></label>
+    <label>Aerolínea <input class="airline_q" placeholder="buscar..."> <select class="airline_id"></select></label>
+    <label>Commodity <select class="commodity_id"></select></label><br>
+    <label>Vigente hasta <input type="date" class="valid_to"></label>
+    <label>Ajuste MIN (+) <input class="min_adjust" value="0" size="5"></label>
+    <label>Cost <input class="cost" value="0" size="5"></label>
+    <label>Offer <select class="offer"><option value="1">Sí</option><option value="0">No</option></select></label>
+    <label>Aeronave <select class="airchaft"><option value="2">PAX</option><option value="1">CAO</option><option value="3">CAO/PAX</option></select></label><br>
+    <label style="display:block">Comentarios <br><textarea class="comments" rows="4" cols="120"></textarea></label>
+  </fieldset>
+  <fieldset><legend>Tariff fees (se crean para CADA tarifa de este PDF, por kg)</legend>
+    <div class="fees"></div>
+    <select class="fee_pick"></select> <button type="button" class="fee_add">+ Agregar fee</button>
+    <div class="fuel_note"></div>
+  </fieldset>
+  <div class="count"></div>
+  <table><thead><tr><th></th><th>Origen</th><th>Destino</th><th>MIN</th><th>N</th><th>45</th><th>100</th><th>300</th><th>500</th><th>1000</th><th class="fuel_th">Fuel/kg</th></tr></thead>
+  <tbody class="rows"></tbody></table>
+  <button type="button" class="insert">Insertar este PDF</button>
+  </div>
+</div>
+</template>
+
+<script>
+const $=id=>document.getElementById(id),msg=$('msg');
+const say=(el,t,c)=>{el.textContent=t;el.className='status '+(c||'')};
+const F=['min','n','w45','w100','w300','w500','w1000','fuel'];
+let FEES=[],COMMODITIES=[];
+const cards=[];
+
+async function api(url,opt){
+  const r=await fetch(url,opt);const d=await r.json().catch(()=>({detail:'Error '+r.status}));
+  if(!r.ok)throw d.detail||('Error '+r.status);return d}
+
+const opt=c=>`<option value="${c.id}">${c.name} (#${c.id})</option>`;
+function wireSearch(q,sel){
+  let t;q.oninput=()=>{clearTimeout(t);t=setTimeout(async()=>{
+    if(q.value.trim().length<2)return;
+    sel.innerHTML=(await api('/tariffs/companies?q='+encodeURIComponent(q.value.trim()))).map(opt).join('')},300)}}
+async function prefill(q,sel,name){
+  if(!name)return;q.value=name;
+  sel.innerHTML=(await api('/tariffs/companies?q='+encodeURIComponent(name))).map(opt).join('')}
+
+function makeCard(file){
+  const el=document.getElementById('tpl').content.firstElementChild.cloneNode(true);
+  const $$=c=>el.querySelector('.'+c);
+  el.querySelector('h3').textContent=file.name;
+  $$('review').hidden=true;$$('commodity_id').innerHTML=COMMODITIES.map(c=>`<option value="${c.id}" ${c.id==4?'selected':''}>${c.name}</option>`).join('');
+  $$('fee_pick').innerHTML=FEES.map(f=>`<option value="${f.id}">${f.code} - ${f.name}</option>`).join('');
+  wireSearch($$('provider_q'),$$('provider_id'));wireSearch($$('airline_q'),$$('airline_id'));
+  const card={el,$$,file,fuelFeeId:null,done:false};
+  card.addFee=(id,comment,cost)=>{
+    const f=FEES.find(x=>x.id==id)||{name:'#'+id,code:''};
+    const d=document.createElement('div');d.className='fee';d.dataset.id=id;
+    d.innerHTML=`<b>${f.code||''} ${f.name}</b> comentario <input class="fc" value="${comment||''}" size="14"> costo/kg <input class="fk" value="${cost??0}" size="6"> <button type="button">quitar</button>`;
+    d.querySelector('button').onclick=()=>d.remove();$$('fees').appendChild(d)};
+  $$('fee_add').onclick=()=>card.addFee($$('fee_pick').value,'',0);
+  $$('insert').onclick=()=>insertCard(card);
+  $('cards').appendChild(el);cards.push(card);return card}
+
+function fill(card,d){
+  const {$$}=card,pf=d.profile;card.fuelFeeId=(pf&&pf.fuel_fee_id)||null;
+  return (async()=>{
+    if(pf){
+      $$('provider_id').innerHTML=opt({id:pf.provider_id,name:pf.provider_name});$$('airline_id').innerHTML=opt({id:pf.airline_id,name:pf.airline_name});
+      $$('provider_q').value=pf.provider_name||'';$$('airline_q').value=pf.airline_name||'';
+      (pf.fees||[]).forEach(f=>card.addFee(f.fee_id,f.fee_comment,f.cost_unit));
+      $$('commodity_id').value=pf.commodity_id;$$('airchaft').value=pf.airchaft;$$('cost').value=pf.cost;$$('offer').value=pf.offer;
+    }else{await prefill($$('airline_q'),$$('airline_id'),d.airline);await prefill($$('provider_q'),$$('provider_id'),d.agent||d.airline)}
+    $$('valid_to').value=d.valid_to||'';$$('comments').value=d.comments||'';
+    const hasFuel=d.rows.some(r=>r.fuel!=null);
+    $$('fuel_th').hidden=!hasFuel;
+    $$('fuel_note').textContent=card.fuelFeeId&&hasFuel?'La columna Fuel/kg de cada fila se inserta como fee FSC (solo si es mayor a 0).':'';
+    $$('rows').innerHTML=d.rows.map(r=>`<tr class="${r.unknown.length||r.min==null?'bad':''}" title="${r.unknown.length?'Sin ID en transports: '+r.unknown:(r.min==null?'Falta el MIN':'')}">
+      <td><input type="checkbox" checked></td>
+      <td><input class="code" value="${r.origin}"></td><td><input class="code" value="${r.destination}"></td>
+      ${F.map(k=>`<td ${k=='fuel'&&!hasFuel?'hidden':''}><input data-k="${k}" value="${r[k]??''}"></td>`).join('')}</tr>`).join('');
+    $$('count').textContent=(pf?'Cliente detectado: '+pf.name+'. ':'Cliente no reconocido: elige proveedor y aerolínea. ')+d.rows.length+' filas extraídas. Las filas en rojo tienen un aeropuerto que no existe en la base o no tienen MIN.';
+    $$('review').hidden=false})()}
+
+function collect(card){
+  const {$$}=card;
+  const rows=[...$$('rows').querySelectorAll('tr')].filter(tr=>tr.querySelector('input[type=checkbox]').checked).map(tr=>{
+    const [o,d]=tr.querySelectorAll('input.code');const r={origin:o.value.toUpperCase().trim(),destination:d.value.toUpperCase().trim()};
+    tr.querySelectorAll('input[data-k]').forEach(i=>r[i.dataset.k]=i.value===''?null:Number(i.value));return r});
+  const h={provider_id:+$$('provider_id').value,airline_id:+$$('airline_id').value,commodity_id:+$$('commodity_id').value,
+    valid_to:$$('valid_to').value,min_adjust:+$$('min_adjust').value||0,cost:+$$('cost').value||0,offer:+$$('offer').value,
+    airchaft:+$$('airchaft').value,comments:$$('comments').value,fuel_fee_id:card.fuelFeeId,
+    fees:[...$$('fees').querySelectorAll('.fee')].map(e=>({fee_id:+e.dataset.id,fee_comment:e.querySelector('.fc').value||null,cost_unit:+e.querySelector('.fk').value||0}))};
+  return {header:h,rows}}
+
+async function insertCard(card,ask=true){
+  const st=card.$$('status'),{header,rows}=collect(card);
+  if(!header.provider_id||!header.airline_id||!header.valid_to)return say(st,'Faltan proveedor, aerolínea o fecha final','err');
+  if(!rows.length)return say(st,'No hay filas seleccionadas','err');
+  if(ask&&!confirm(card.file.name+': insertar '+rows.length+' tarifas (con '+header.fees.length+' fee(s) cada una)?'))return;
+  card.$$('insert').disabled=true;
+  try{const d=await api('/tariffs/insert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({header,rows})});
+    say(st,'Insertadas '+d.tariffs+' tarifas y '+d.fees+' tariff fees.','ok');card.done=true;card.el.classList.add('done');
+    card.$$('review').querySelectorAll('input,select,textarea,button').forEach(x=>x.disabled=true)}
+  catch(e){say(st,'Error: '+e,'err');card.$$('insert').disabled=false}
+  $('insertAll').hidden=!cards.some(c=>!c.done&&!c.failed)}
+
+$('go').onclick=async()=>{
+  const files=[...$('file').files];if(!files.length)return say(msg,'Elige uno o más PDFs','err');
+  $('cards').innerHTML='';cards.length=0;$('insertAll').hidden=true;say(msg,'Analizando '+files.length+' PDF(s)... (unos segundos por PDF)');
+  [FEES,COMMODITIES]=await Promise.all([api('/tariffs/fees'),api('/tariffs/commodities')]);
+  const made=files.map(makeCard);
+  for(const [i,card] of made.entries()){
+    say(card.$$('status'),'Analizando...');
+    const fd=new FormData();fd.append('file',files[i]);
+    try{const d=await api('/tariffs/parse',{method:'POST',body:fd});await fill(card,d);say(card.$$('status'),'Revisa y corrige antes de insertar.')}
+    catch(e){card.failed=true;card.$$('review').hidden=true;say(card.$$('status'),'Error: '+e,'err')}}
+  const ok=made.filter(c=>!c.failed).length;say(msg,ok+' de '+files.length+' PDF(s) listos para revisar.');
+  $('insertAll').hidden=!ok};
+
+$('insertAll').onclick=async()=>{
+  const pend=cards.filter(c=>!c.done&&!c.failed);
+  if(!confirm('Insertar '+pend.length+' PDF(s) pendientes con lo que ves en cada tarjeta?'))return;
+  for(const c of pend)await insertCard(c,false)};
+</script></body></html>

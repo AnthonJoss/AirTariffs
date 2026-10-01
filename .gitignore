@@ -1,0 +1,10 @@
+credentials.json
+token.json
+pdfs/
+.venv/
+__pycache__/
+CLAUDE.local.md
+db_conn.py
+.env
+uploads/
+cache/
