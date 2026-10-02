@@ -14,6 +14,7 @@ Air fare/tariff REST API built with FastAPI (single module: `main.py`). Dependen
 - Flujo: `/tariffs-ui` sube el PDF → `tariff_parser.py` (pdfplumber + OpenAI + perfiles por cliente en `client_profiles.py`) → pantalla de revisión → `tariff_db.insert_tariffs` (una transacción) en `tariffs`.
 - Requiere `OPENAI_API_KEY` (gpt-4o) (env o `.env`). La BD usa `db_conn.py`, perfil `local` por defecto (no cambiar a `remote` sin pedirlo).
 - Mapeo de tramos de peso → columnas `n/forty_five_more/hundred_more/three_hundred_more/five_hundred_more/thousand_more`: tramo más alto ≤ el requerido, si no hay el más bajo (misma regla que MailReader `analizar_egypt.py`).
+- Fees (`tariff_feeds`, USD/kg): `header.fees` van a todas las filas; `rows[].fees` solo a esa fila (fees individuales del office); `fuel_fee_id` + columna fuel por fila.
 - Gmail: `python gmail_client.py` autoriza una vez; `/mails-ui` baja PDFs a `pdfs/`.
 
 ## Velocidad del análisis

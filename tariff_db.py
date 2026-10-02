@@ -113,7 +113,11 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
             for row, vals in zip(rows, data):
                 cur.execute(INSERT_SQL, vals)
                 tariff_id = cur.lastrowid
-                row_fees = [(f["fee_id"], f.get("fee_comment"), f["cost_unit"]) for f in fees]
+                # Fees generales (header, todas las filas) + individuales de esta fila.
+                row_fees = [
+                    (f["fee_id"], f.get("fee_comment"), f["cost_unit"])
+                    for f in fees + (row.get("fees") or [])
+                ]
                 if fuel_fee_id and row.get("fuel"):
                     row_fees.append((fuel_fee_id, None, row["fuel"]))
                 for fee_id, comment, cost in row_fees:
