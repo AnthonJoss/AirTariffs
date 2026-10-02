@@ -15,7 +15,9 @@ import pdfplumber
 from openai import OpenAI
 
 import client_profiles
+import client_terms
 import egypt_parser
+import tariff_db
 
 CACHE_DIR = Path(__file__).parent / "cache"
 MODEL = os.getenv("TARIFF_LLM_MODEL", "gpt-4o")
@@ -71,8 +73,9 @@ def pdf_text(path: Path) -> str:
     return _BROKEN_AMOUNT.sub(lambda m: f"${m.group(1).replace(' ', '')}.{m.group(2)}", text)
 
 
-def extract_with_llm(text: str, skip_comments: bool = False) -> dict:
-    system = SYSTEM + (NO_COMMENTS if skip_comments else "")
+def extract_with_llm(text: str, skip_comments: bool = False, context: str = "") -> dict:
+    # context: términos/instrucciones del cliente (client_terms.prompt_section).
+    system = SYSTEM + (NO_COMMENTS if skip_comments and not context else "") + context
     # Misma entrada + mismas instrucciones + mismo modelo = misma respuesta: se reutiliza del disco.
     key = hashlib.sha256("\n".join([MODEL, system, text]).encode()).hexdigest()
     cache_file = CACHE_DIR / f"{key}.json"
@@ -130,15 +133,21 @@ def comments_html(text) -> str:
     return "<p>" + "<br>".join(f"•{l}" for l in lines) + "</p>" if lines else ""
 
 
-def parse_pdf(path: Path) -> dict:
+def parse_pdf(path: Path, client_id: int | None = None, instructions: str | None = None) -> dict:
     text = pdf_text(path)
     if not text:
         raise RuntimeError("El PDF no tiene texto extraíble (¿escaneado?). Requiere OCR.")
     prof = client_profiles.detect(path.name, text)
+    # Términos guardados del cliente elegido en el office o, si no eligió, del detectado
+    # (provider y aerolínea del perfil) + instrucciones de esta subida.
+    company_ids = [client_id] if client_id else ([prof["provider_id"], prof["airline_id"]] if prof else [])
+    terms = tariff_db.get_client_terms(company_ids)
+    context = client_terms.prompt_section(terms, instructions)
     # EgyptAir tiene formato fijo: parser determinista (instantáneo); si no cuadra, cae al LLM.
-    data = egypt_parser.parse_egypt(text) if prof and prof["name"] == "EgyptAir" else None
+    # Con términos/instrucciones se usa el LLM, que es el que puede aplicarlos.
+    data = egypt_parser.parse_egypt(text) if prof and prof["name"] == "EgyptAir" and not context else None
     if data is None:
-        data = extract_with_llm(text, skip_comments=bool(prof and prof.get("comments")))
+        data = extract_with_llm(text, skip_comments=bool(prof and prof.get("comments")), context=context)
     data["rows"] = [to_columns(r) for r in data.get("rows", [])]
     # Una columna de fuel toda en 0/None no es una columna real (EgyptAir): no se muestra ni crea fees.
     if not any(r["fuel"] for r in data["rows"]):
@@ -146,8 +155,13 @@ def parse_pdf(path: Path) -> dict:
             r["fuel"] = None
     data["comments"] = comments_html(data.get("comments"))
     data["profile"] = prof
-    if prof:
+    data["ai_context"] = client_terms.summary(terms, instructions)
+    if prof and not context:
         data["comments"] = prof.get("comments", data["comments"])
+    elif prof and prof.get("comments"):
+        # Con términos, se conservan los comentarios fijos del perfil y se suman los del LLM.
+        data["comments"] = prof["comments"] + data["comments"]
+    if prof:
         if prof.get("min_rule") == "100kg_x_rate100":
             for r in data["rows"]:
                 if r["min"] is None and r["w100"] is not None:

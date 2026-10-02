@@ -1,5 +1,8 @@
 """Acceso a MySQL para tarifas aéreas (usa db_conn.py, perfil local por defecto)."""
+import json
 import os
+
+import mysql.connector
 
 from db_conn import db_conn
 
@@ -27,6 +30,52 @@ def company_names(ids) -> dict[int, str]:
     with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
         cur.execute(f"SELECT id, fullname FROM companies WHERE id IN ({','.join(['%s'] * len(ids))})", ids)
         return dict(cur.fetchall())
+
+
+def get_client_terms(company_ids) -> list[dict]:
+    """Términos guardados (airtariff_client_terms) de esas empresas, con el texto de sus archivos."""
+    ids = sorted({int(i) for i in company_ids if i})
+    if not ids:
+        return []
+    with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT company_id, company_name, instructions, terms_files, updated_by, updated_at "
+                f"FROM airtariff_client_terms WHERE company_id IN ({','.join(['%s'] * len(ids))})",
+                ids,
+            )
+        except mysql.connector.errors.ProgrammingError as e:
+            # 1146 = la tabla aun no existe en esa BD: se analiza sin terminos en vez de fallar.
+            if e.errno == 1146:
+                return []
+            raise
+        return [
+            {
+                "company_id": cid,
+                "company_name": name,
+                "instructions": instr or "",
+                "files": json.loads(files) if files else [],
+                "updated_by": by,
+                "updated_at": at.strftime("%Y-%m-%d %H:%M") if at else None,
+            }
+            for cid, name, instr, files, by, at in cur.fetchall()
+        ]
+
+
+def save_client_terms(company_id: int, company_name: str, instructions: str, files: list[dict], updated_by: str):
+    """Crea o reemplaza los términos de una empresa (una fila por company_id)."""
+    # Sin VALUES() en el UPDATE: MySQL 8 lo marca deprecado y raise_on_warnings lo vuelve error.
+    vals = (company_name, instructions, json.dumps(files, ensure_ascii=False), updated_by)
+    with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO airtariff_client_terms
+                 (company_id, company_name, instructions, terms_files, updated_by, created_at, updated_at)
+               VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+               ON DUPLICATE KEY UPDATE company_name=%s, instructions=%s, terms_files=%s,
+                 updated_by=%s, updated_at=NOW()""",
+            (company_id, *vals, *vals),
+        )
+        conn.commit()
 
 
 def fees_catalog():

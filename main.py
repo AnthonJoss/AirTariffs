@@ -1,13 +1,15 @@
 import hmac
+import json
 import os
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+import client_terms
 import gmail_client
 import tariff_db
 import tariff_parser
@@ -80,8 +82,8 @@ async def mails_ui():
 
 # ---------------- Tarifas: upload -> revisión -> insert ----------------
 
-def _draft(path: Path) -> dict:
-    data = tariff_parser.parse_pdf(path)
+def _draft(path: Path, client_id: int | None = None, instructions: str | None = None) -> dict:
+    data = tariff_parser.parse_pdf(path, client_id, instructions)
     ids = tariff_db.transport_ids([r["origin"] for r in data["rows"]] + [r["destination"] for r in data["rows"]])
     for r in data["rows"]:
         r["unknown"] = [c for c in (r["origin"], r["destination"]) if c not in ids]
@@ -94,17 +96,65 @@ def _draft(path: Path) -> dict:
 
 
 @app.post("/tariffs/parse")
-async def parse_tariff_pdf(file: UploadFile = File(...)):
-    """Sube un PDF y devuelve el borrador extraído (NO inserta nada)."""
+async def parse_tariff_pdf(
+    file: UploadFile = File(...),
+    client_id: int | None = Form(None),
+    instructions: str | None = Form(None),
+):
+    """Sube un PDF y devuelve el borrador extraído (NO inserta nada).
+
+    client_id: empresa cuyos términos guardados se aplican (si no, los del perfil detectado).
+    instructions: instrucciones extra solo para este análisis.
+    """
     if not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(400, "Solo PDF")
     UPLOAD_DIR.mkdir(exist_ok=True)
     dest = UPLOAD_DIR / Path(file.filename).name
     dest.write_bytes(await file.read())
     try:
-        return await run_in_threadpool(_draft, dest)
+        return await run_in_threadpool(_draft, dest, client_id, instructions)
     except Exception as e:
         raise HTTPException(422, f"{type(e).__name__}: {e}")
+
+
+def _terms_view(company_id: int) -> dict:
+    found = tariff_db.get_client_terms([company_id])
+    t = found[0] if found else {"company_id": company_id, "company_name": None, "instructions": "", "files": [],
+                                "updated_by": None, "updated_at": None}
+    # El texto de los archivos no viaja al office (solo nombre y tamaño).
+    return {**t, "files": [{k: f[k] for k in ("name", "chars", "uploaded_at")} for f in t["files"]]}
+
+
+@app.get("/tariffs/terms")
+async def get_terms(company_id: int):
+    """Términos/instrucciones guardados de una empresa para el análisis con IA."""
+    return await run_in_threadpool(_terms_view, company_id)
+
+
+@app.post("/tariffs/terms")
+async def save_terms(
+    company_id: int = Form(...),
+    company_name: str = Form(""),
+    instructions: str = Form(""),
+    keep: str = Form("[]"),
+    updated_by: str = Form(""),
+    files: list[UploadFile] = File(default=[]),
+):
+    """Guarda los términos de una empresa: instrucciones + archivos nuevos (PDF/TXT) y los
+    existentes que se conservan (keep: JSON con sus nombres)."""
+    try:
+        keep_names = set(json.loads(keep or "[]"))
+        current = tariff_db.get_client_terms([company_id])
+        kept = [f for f in (current[0]["files"] if current else []) if f["name"] in keep_names]
+        new = [client_terms.file_entry(f.filename or "terms.txt", await f.read()) for f in files]
+        names = {f["name"] for f in new}
+        merged = [f for f in kept if f["name"] not in names] + new
+        await run_in_threadpool(
+            tariff_db.save_client_terms, company_id, company_name, instructions.strip(), merged, updated_by
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return await run_in_threadpool(_terms_view, company_id)
 
 
 @app.get("/tariffs/companies")
