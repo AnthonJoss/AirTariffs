@@ -1,9 +1,11 @@
+import hmac
+import os
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import gmail_client
@@ -15,12 +17,25 @@ UPLOAD_DIR = Path(__file__).parent / "uploads"
 app = FastAPI()
 
 # office_tms (Vite en :5174, o su dominio en producción) llama a /tariffs/* desde el navegador.
+# En Cloud Run CORS_ORIGIN_REGEX agrega el dominio de office-tms.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origin_regex=os.getenv("CORS_ORIGIN_REGEX", r"https?://(localhost|127\.0\.0\.1)(:\d+)?"),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# En Cloud Run el servicio es público (como el resto): con TARIFF_API_KEY definida,
+# todo salvo "/" exige el header X-Api-Key (lo manda tmsbackendnew). En local no se define.
+API_KEY = os.getenv("TARIFF_API_KEY")
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if API_KEY and request.url.path != "/" and request.method != "OPTIONS":
+        if not hmac.compare_digest(request.headers.get("x-api-key", ""), API_KEY):
+            return JSONResponse({"detail": "API key inválida"}, status_code=401)
+    return await call_next(request)
 
 
 @app.get("/")

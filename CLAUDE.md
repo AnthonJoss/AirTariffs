@@ -21,3 +21,11 @@ Air fare/tariff REST API built with FastAPI (single module: `main.py`). Dependen
 - EgyptAir se analiza sin LLM con `egypt_parser.py` (determinista, instantáneo); si el formato no cuadra devuelve `None` y se usa el LLM.
 - El LLM (ITA, Next Logistics, clientes nuevos) responde en formato compacto y su resultado se cachea en `cache/` por hash del texto: repetir un PDF es instantáneo.
 - `office_tms` no llama a uvicorn directo: pasa por `tmsbackendnew` (`TariffUploadController`, `/api/v1/nextmind/tariff-upload/*`, solo Admin), que apunta a `TARIFF_UPLOAD_SERVICE_URL`.
+
+## Cloud Run
+
+- Servicio `airtariffs` (us-east1, proyecto `fluid-guide-362602`): https://airtariffs-717497920821.us-east1.run.app — mismo patrón que `next-notice-carrier`.
+- Redeploy: `gcloud run deploy airtariffs --source . --region us-east1` (conserva env vars y secretos).
+- BD: `MYSQL_PROFILE=remote` + `MYSQL_SOCKET_OVERRIDE=/cloudsql/fluid-guide-362602:us-east1:next-logistics-instance` (ver `db_conn.py`). En local el perfil sigue siendo `local` y la contraseña va en `.env` como `MYSQL_PASSWORD_OVERRIDE`.
+- Secret Manager: `OPENAI_API_KEY`←`openai-api-key`, `MYSQL_PASSWORD_OVERRIDE`←`MYSQL_PASSWORD_NEXTLOG`, `TARIFF_API_KEY`←`AIRTARIFFS_API_KEY`.
+- Con `TARIFF_API_KEY` definida todo salvo `/` exige `X-Api-Key`. tmsbackendnew lo manda desde `TARIFF_UPLOAD_API_KEY` (mismo secreto). CORS en `CORS_ORIGIN_REGEX` (incluye office-tms en run.app).

@@ -1,0 +1,15 @@
+.git
+.idea
+.venv
+__pycache__
+.env
+credentials.json
+token.json
+pdfs/
+uploads/
+cache/
+excels/
+design/
+CLAUDE*.md
+test_main.http
+.gcloudignore

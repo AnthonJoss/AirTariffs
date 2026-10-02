@@ -1,7 +1,10 @@
 """Acceso a MySQL para tarifas aéreas (usa db_conn.py, perfil local por defecto)."""
+import os
+
 from db_conn import db_conn
 
-PROFILE = "local"
+# En Cloud Run MYSQL_PROFILE=remote (Cloud SQL); en local queda "local".
+PROFILE = os.getenv("MYSQL_PROFILE", "local")
 
 TYPE_TARIFF_AIR = 3
 DEFAULT_USER_ID = 1
