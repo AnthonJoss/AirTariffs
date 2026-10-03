@@ -143,9 +143,11 @@ def parse_pdf(path: Path, client_id: int | None = None, instructions: str | None
     company_ids = [client_id] if client_id else ([prof["provider_id"], prof["airline_id"]] if prof else [])
     terms = tariff_db.get_client_terms(company_ids)
     context = client_terms.prompt_section(terms, instructions)
-    # EgyptAir tiene formato fijo: parser determinista (instantáneo); si no cuadra, cae al LLM.
-    # Con términos/instrucciones se usa el LLM, que es el que puede aplicarlos.
-    data = egypt_parser.parse_egypt(text) if prof and prof["name"] == "EgyptAir" and not context else None
+    # EgyptAir tiene formato fijo: parser determinista (instantáneo, sin LLM); si no cuadra, cae al
+    # LLM. Los términos guardados no lo fuerzan: sus fees viven en air_fee_rules (los aplica el
+    # office/backend sin IA). Solo instrucciones extra de esta subida pasan por el LLM.
+    use_fixed = prof and prof["name"] == "EgyptAir" and not (instructions or "").strip()
+    data = egypt_parser.parse_egypt(text) if use_fixed else None
     if data is None:
         data = extract_with_llm(text, skip_comments=bool(prof and prof.get("comments")), context=context)
     data["rows"] = [to_columns(r) for r in data.get("rows", [])]

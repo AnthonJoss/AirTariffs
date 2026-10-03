@@ -100,3 +100,9 @@ Content-Type: application/json
 }
 
 ###
+
+### Propone reglas de fees (air_fee_rules) desde los términos guardados de la aerolínea (EgyptAir 8296 + ATC 8265)
+POST http://127.0.0.1:8001/tariffs/rules/draft
+Content-Type: application/json
+
+{"airline_id": 8296, "company_ids": [8265], "text": "Transit Shipment Fee: $.05/kg with a $25.00 min (not applicable for Final destination CAI)."}

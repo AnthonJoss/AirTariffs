@@ -84,6 +84,17 @@ def fees_catalog():
         return [{"id": i, "code": c, "name": n} for i, c, n in cur.fetchall()]
 
 
+def air_fee_ids() -> set[int]:
+    """Fees que de verdad se usan en tarifas aéreas (tariff_feeds de tariffs type 3)."""
+    with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT tf.fee_id FROM tariff_feeds tf JOIN tariffs t ON t.id = tf.tariff_id "
+            "WHERE t.type_tariff = %s AND tf.fee_id IS NOT NULL",
+            (TYPE_TARIFF_AIR,),
+        )
+        return {i for (i,) in cur.fetchall()}
+
+
 def commodities():
     with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
         cur.execute("SELECT id, fullname FROM commodities ORDER BY fullname")
@@ -95,8 +106,12 @@ def transport_ids(codes) -> dict[str, int]:
     if not codes:
         return {}
     with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
+        # Solo aeropuertos (type_id = 1): ciudades/zips (3) y puertos (2) también usan `codigo`
+        # y podían ganarle al aeropuerto con la misma sigla. ORDER BY id: con varias filas del
+        # mismo aeropuerto (ABE = Allentown/Bethlehem/Easton) gana siempre la misma (la última).
         cur.execute(
-            f"SELECT id, codigo FROM transports WHERE codigo IN ({','.join(['%s'] * len(codes))})", codes
+            f"SELECT id, codigo FROM transports WHERE type_id = 1 AND codigo IN ({','.join(['%s'] * len(codes))}) ORDER BY id",
+            codes,
         )
         return {str(c).upper(): i for i, c in cur.fetchall()}
 
