@@ -35,6 +35,7 @@ Ejemplos en `test_main.http`.
 | POST | `/tariffs/parse` | Multipart `file` (PDF), `client_id` (opcional), `instructions` (opcional) → borrador `{airline, valid_to, comments, rows[], profile, ai_context}`. No inserta. |
 | GET | `/tariffs/terms?company_id=` | Términos guardados de una empresa (`instructions`, `files[]` con nombre/tamaño, `updated_by/at`). |
 | POST | `/tariffs/terms` | Multipart `company_id`, `company_name`, `instructions`, `keep` (JSON con nombres a conservar), `files` (PDF/TXT/MD/CSV), `updated_by`. |
+| POST | `/tariffs/rules/draft` | JSON `{airline_id, company_ids[], text}` → `{rules[], skipped[], sources}`: reglas de fees propuestas por el LLM desde los términos guardados (`fee_rules_ai.py`, cache por hash). No guarda. |
 | GET | `/tariffs/companies?q=` | Empresas por nombre. |
 | GET | `/tariffs/fees` | Catálogo de fees (aéreos primero). |
 | GET | `/tariffs/commodities` | Catálogo de commodities. |
@@ -67,6 +68,28 @@ Una fila por `company_id`: `company_name`, `instructions`, `terms_files` (JSON
 `[{name, chars, text, uploaded_at}]`), `updated_by`, timestamps. La crea el backend
 (migración + `database/sql/cloud_sql_migration_2026_10_02_create_airtariff_client_terms.sql`).
 
+## Fees por aerolínea (`air_fee_rules`)
+
+Los recargos de una aerolínea (ej. EgyptAir: Transit Shipment Fee $0.05/kg, min $25, no aplica
+a destino CAI) no se sacan del PDF ni del prompt: son reglas guardadas una vez por aerolínea en
+`air_fee_rules` (backend: `AirFeeRuleController`, `AirFeeRules`). El office las muestra en
+General fees y el backend las aplica al cotizar, con su mínimo y condiciones. **No se copian a
+`tariff_feeds`** ni el mínimo se escribe en `fee_comment`: el insert solo recibe los fees simples
+por kg (general / PDF / fila). Un fee con mínimo se carga como regla.
+
+Las reglas se pueden proponer con IA: "✦ Suggest from … terms" en el office llama a
+`POST /tariffs/rules/draft`, que manda las instrucciones y archivos guardados de la aerolínea
+(y de su provider) + el catálogo de fees al LLM **una vez** (cacheado por hash del texto) y
+devuelve reglas validadas (fee del catálogo, siglas que existen como aeropuerto). El usuario
+revisa y guarda cada una; lo que no es una regla (cargos incluidos, condiciones que no son de
+ruta, restricciones) vuelve en `skipped` con el motivo. Los cargos condicionados al envío
+("if tendered unscreened", collect, perecederos, DG…) se descartan también por código, aunque el
+modelo los proponga. Modelo: `TARIFF_RULES_MODEL` (`gpt-4.1-mini`; probado contra `gpt-4o-mini`,
+que elige peor el fee del catálogo).
+
+Por eso los términos guardados del cliente ya no fuerzan el LLM para EgyptAir: el parser
+determinista se usa siempre que no haya instrucciones extra para esa subida.
+
 ## Configuración
 
 | Variable | Local | Cloud Run |
@@ -80,6 +103,7 @@ Una fila por `company_id`: `company_name`, `instructions`, `terms_files` (JSON
 | `TARIFF_API_KEY` | sin definir | Secreto `AIRTARIFFS_API_KEY` |
 | `CORS_ORIGIN_REGEX` | localhost | localhost + `office-tms-*.run.app` |
 | `TARIFF_LLM_MODEL` | `gpt-4o` | `gpt-4o` |
+| `TARIFF_RULES_MODEL` | `gpt-4.1-mini` | `gpt-4.1-mini` (propuesta de reglas de fees, `fee_rules_ai.py`) |
 
 ## Correr y desplegar
 

@@ -63,8 +63,10 @@ def prompt_section(terms: list[dict], extra: str | None = None) -> str:
         "Aplícalos al leer este PDF: cómo interpretar columnas, mínimos, recargos, exclusiones, "
         "orígenes/destinos y vigencias. Si las instrucciones del usuario contradicen las reglas "
         "generales de arriba, prevalecen las del usuario. Nunca inventes filas ni tarifas que no "
-        "estén en el PDF. Resume en \"comments\" las condiciones de estos términos que afecten la "
-        "cotización (recargos, mínimos, exclusiones, restricciones de carga).\n\n" + body
+        "estén en el PDF. No sumes recargos a las tarifas: los fees (por kg, mínimos, exclusiones "
+        "por destino) se aplican aparte con las reglas por aerolínea (air_fee_rules). Resume en "
+        "\"comments\" las condiciones de estos términos que afecten la cotización (recargos, "
+        "mínimos, exclusiones, restricciones de carga).\n\n" + body
     )
 
 

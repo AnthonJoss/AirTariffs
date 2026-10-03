@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import client_terms
+import fee_rules_ai
 import gmail_client
 import tariff_db
 import tariff_parser
@@ -155,6 +156,39 @@ async def save_terms(
     except ValueError as e:
         raise HTTPException(422, str(e))
     return await run_in_threadpool(_terms_view, company_id)
+
+
+class RulesDraftRequest(BaseModel):
+    airline_id: int
+    # Empresas cuyos términos guardados se leen (la aerolínea y, si hay, su provider).
+    company_ids: list[int] = []
+    # Texto extra solo para esta propuesta (ej. una línea pegada a mano).
+    text: str = ""
+
+
+def _rules_draft(body: RulesDraftRequest) -> dict:
+    terms = tariff_db.get_client_terms([body.airline_id, *body.company_ids])
+    text = "\n\n".join(p for p in (fee_rules_ai.terms_text(terms), body.text.strip()) if p)
+    if not text:
+        raise ValueError("No saved terms or instructions for this airline. Save them in AI instructions ▸ Client terms first.")
+    catalog = tariff_db.fees_catalog()
+    air_ids = tariff_db.air_fee_ids()
+    raw = fee_rules_ai.ask_llm(text, catalog, air_ids)
+    codes = [c for r in raw.get("rules") or [] if isinstance(r, dict)
+             for k in fee_rules_ai.CODE_KEYS for c in (r.get(k) or []) if isinstance(c, str)]
+    airports = set(tariff_db.transport_ids([c.strip().upper() for c in codes]))
+    out = fee_rules_ai.normalize(raw, {f["id"] for f in catalog}, airports, air_ids)
+    return {**out, "airline_id": body.airline_id, "sources": [t.get("company_name") or t["company_id"] for t in terms]}
+
+
+@app.post("/tariffs/rules/draft")
+async def rules_draft(body: RulesDraftRequest):
+    """Propone reglas de fees (air_fee_rules) a partir de los términos guardados de la aerolínea.
+    Una llamada al LLM por texto (cacheada); NO guarda nada: el office las confirma una por una."""
+    try:
+        return await run_in_threadpool(_rules_draft, body)
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(422, str(e))
 
 
 @app.get("/tariffs/companies")

@@ -16,6 +16,7 @@ Air fare/tariff REST API built with FastAPI (single module: `main.py`). Dependen
 - Mapeo de tramos de peso → columnas `n/forty_five_more/hundred_more/three_hundred_more/five_hundred_more/thousand_more`: tramo más alto ≤ el requerido, si no hay el más bajo (misma regla que MailReader `analizar_egypt.py`).
 - Fees (`tariff_feeds`, USD/kg): `header.fees` van a todas las filas; `rows[].fees` solo a esa fila (fees individuales del office); `fuel_fee_id` + columna fuel por fila.
 - Términos por cliente (`client_terms.py`, tabla `airtariff_client_terms`, creada desde el backend): instrucciones + texto de archivos PDF/TXT por `company_id`; `/tariffs/parse` los mete en el prompt (cliente elegido `client_id` o provider/airline del perfil) + `instructions` extra. `GET/POST /tariffs/terms`.
+- Reglas de fees por aerolínea (`air_fee_rules`, del backend): `POST /tariffs/rules/draft` (`fee_rules_ai.py`) las propone con el LLM desde los términos guardados; no guarda nada. Las reglas no se copian a `tariff_feeds` (las aplica el backend al cotizar); el insert solo recibe fees simples por kg.
 - Gmail: `python gmail_client.py` autoriza una vez; `/mails-ui` baja PDFs a `pdfs/`.
 
 ## Velocidad del análisis
