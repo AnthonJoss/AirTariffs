@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 import client_terms
+import excel_reader
 import fee_rules_ai
 import gmail_client
 import tariff_db
@@ -83,8 +84,9 @@ async def mails_ui():
 
 # ---------------- Tarifas: upload -> revisión -> insert ----------------
 
-def _draft(path: Path, client_id: int | None = None, instructions: str | None = None) -> dict:
-    data = tariff_parser.parse_pdf(path, client_id, instructions)
+def _draft(path: Path, client_id: int | None = None, instructions: str | None = None,
+           sheets: list[str] | None = None) -> dict:
+    data = tariff_parser.parse_file(path, client_id, instructions, sheets)
     ids = tariff_db.transport_ids([r["origin"] for r in data["rows"]] + [r["destination"] for r in data["rows"]])
     for r in data["rows"]:
         r["unknown"] = [c for c in (r["origin"], r["destination"]) if c not in ids]
@@ -101,19 +103,33 @@ async def parse_tariff_pdf(
     file: UploadFile = File(...),
     client_id: int | None = Form(None),
     instructions: str | None = Form(None),
+    sheets: str | None = Form(None),
 ):
-    """Sube un PDF y devuelve el borrador extraído (NO inserta nada).
+    """Sube un PDF o Excel (.xlsx/.xlsm) y devuelve el borrador extraído (NO inserta nada).
 
     client_id: empresa cuyos términos guardados se aplican (si no, los del perfil detectado).
     instructions: instrucciones extra solo para este análisis.
+    sheets: JSON con los nombres de las hojas a leer (solo Excel; vacío = las visibles con datos).
     """
-    if not (file.filename or "").lower().endswith(".pdf"):
-        raise HTTPException(400, "Solo PDF")
+    if not (file.filename or "").lower().endswith(tariff_parser.SUPPORTED_SUFFIXES):
+        raise HTTPException(400, "Solo PDF o Excel (.xlsx, .xlsm)")
     UPLOAD_DIR.mkdir(exist_ok=True)
     dest = UPLOAD_DIR / Path(file.filename).name
     dest.write_bytes(await file.read())
     try:
-        return await run_in_threadpool(_draft, dest, client_id, instructions)
+        sheet_names = json.loads(sheets) if sheets else None
+        return await run_in_threadpool(_draft, dest, client_id, instructions, sheet_names)
+    except Exception as e:
+        raise HTTPException(422, f"{type(e).__name__}: {e}")
+
+
+@app.post("/tariffs/excel-sheets")
+async def excel_sheets(file: UploadFile = File(...)):
+    """Hojas de un Excel (filas con datos, ocultas por filtro y selección por defecto) para elegir cuáles leer."""
+    if not excel_reader.is_excel(file.filename or ""):
+        raise HTTPException(400, "Solo Excel (.xlsx, .xlsm)")
+    try:
+        return {"sheets": await run_in_threadpool(excel_reader.sheets_info, await file.read())}
     except Exception as e:
         raise HTTPException(422, f"{type(e).__name__}: {e}")
 
@@ -123,7 +139,7 @@ def _terms_view(company_id: int) -> dict:
     t = found[0] if found else {"company_id": company_id, "company_name": None, "instructions": "", "files": [],
                                 "updated_by": None, "updated_at": None}
     # El texto de los archivos no viaja al office (solo nombre y tamaño).
-    return {**t, "files": [{k: f[k] for k in ("name", "chars", "uploaded_at")} for f in t["files"]]}
+    return {**t, "files": [{k: f[k] for k in ("name", "chars", "uploaded_at", "sheets") if k in f} for f in t["files"]]}
 
 
 @app.get("/tariffs/terms")
@@ -138,16 +154,20 @@ async def save_terms(
     company_name: str = Form(""),
     instructions: str = Form(""),
     keep: str = Form("[]"),
+    sheets: str = Form("{}"),
     updated_by: str = Form(""),
     files: list[UploadFile] = File(default=[]),
 ):
     """Guarda los términos de una empresa: instrucciones + archivos nuevos (PDF/TXT) y los
-    existentes que se conservan (keep: JSON con sus nombres)."""
+    existentes que se conservan (keep: JSON con sus nombres). sheets: JSON {archivo: [hojas]} para los
+    Excel nuevos (sin entrada = las visibles con datos)."""
     try:
         keep_names = set(json.loads(keep or "[]"))
         current = tariff_db.get_client_terms([company_id])
         kept = [f for f in (current[0]["files"] if current else []) if f["name"] in keep_names]
-        new = [client_terms.file_entry(f.filename or "terms.txt", await f.read()) for f in files]
+        by_file = json.loads(sheets or "{}")
+        new = [client_terms.file_entry(f.filename or "terms.txt", await f.read(), by_file.get(f.filename))
+               for f in files]
         names = {f["name"] for f in new}
         merged = [f for f in kept if f["name"] not in names] + new
         await run_in_threadpool(
@@ -192,8 +212,9 @@ async def rules_draft(body: RulesDraftRequest):
 
 
 @app.get("/tariffs/companies")
-async def tariff_companies(q: str):
-    return await run_in_threadpool(tariff_db.search_companies, q)
+async def tariff_companies(q: str, type: int | None = None):
+    """`type` opcional: tipo de empresa (types.id), p. ej. 6 = Air Carrier para el campo Airline."""
+    return await run_in_threadpool(tariff_db.search_companies, q, 15, type)
 
 
 @app.get("/tariffs/fees")

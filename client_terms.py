@@ -10,16 +10,24 @@ from datetime import datetime, timezone
 
 import pdfplumber
 
-ALLOWED = (".pdf", ".txt", ".md", ".csv")
+import excel_reader
+
+ALLOWED = (".pdf", ".txt", ".md", ".csv") + excel_reader.EXCEL_SUFFIXES
 
 # Topes para no reventar el contexto del modelo (el PDF de tarifas también va).
 MAX_FILE_CHARS = 40_000
 MAX_PROMPT_CHARS = 40_000
 
 
-def extract_text(filename: str, content: bytes) -> str:
+def extract_text(filename: str, content: bytes, sheets: list[str] | None = None) -> tuple[str, list[str] | None]:
+    """(texto, hojas usadas); las hojas solo aplican a Excel (None = visibles con datos)."""
     name = filename.lower()
-    if name.endswith(".pdf"):
+    used = None
+    if excel_reader.is_excel(name):
+        text, used = excel_reader.excel_text(content, sheets, excel_reader.EXCEL_MAX_CHARS)
+        if not text:
+            raise ValueError(f"{filename}: el Excel no tiene datos en las hojas elegidas.")
+    elif name.endswith(".pdf"):
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             text = "\n\n".join((p.extract_text() or "") for p in pdf.pages).strip()
         if not text:
@@ -28,17 +36,20 @@ def extract_text(filename: str, content: bytes) -> str:
         text = content.decode("utf-8", errors="replace").strip()
     else:
         raise ValueError(f"{filename}: solo se aceptan {', '.join(ALLOWED)}.")
-    return text[:MAX_FILE_CHARS]
+    return text[:MAX_FILE_CHARS], used
 
 
-def file_entry(filename: str, content: bytes) -> dict:
-    text = extract_text(filename, content)
-    return {
+def file_entry(filename: str, content: bytes, sheets: list[str] | None = None) -> dict:
+    text, used = extract_text(filename, content, sheets)
+    entry = {
         "name": filename,
         "chars": len(text),
         "text": text,
         "uploaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
     }
+    if used is not None:
+        entry["sheets"] = used
+    return entry
 
 
 def prompt_section(terms: list[dict], extra: str | None = None) -> str:
@@ -63,7 +74,9 @@ def prompt_section(terms: list[dict], extra: str | None = None) -> str:
         "Aplícalos al leer este PDF: cómo interpretar columnas, mínimos, recargos, exclusiones, "
         "orígenes/destinos y vigencias. Si las instrucciones del usuario contradicen las reglas "
         "generales de arriba, prevalecen las del usuario. Nunca inventes filas ni tarifas que no "
-        "estén en el PDF. No sumes recargos a las tarifas: los fees (por kg, mínimos, exclusiones "
+        "estén en el PDF. Las instrucciones de subir el archivo TAMBIÉN con otro commodity (Dangerous Goods, "
+        "Perishables…, con otro mínimo o un aumento por kg) se aplican aparte: ignóralas al leer las filas y devuelve "
+        "SIEMPRE todas las filas de la tabla con sus tarifas tal como están impresas. No sumes recargos a las tarifas: los fees (por kg, mínimos, exclusiones "
         "por destino) se aplican aparte con las reglas por aerolínea (air_fee_rules). Resume en "
         "\"comments\" las condiciones de estos términos que afecten la cotización (recargos, "
         "mínimos, exclusiones, restricciones de carga).\n\n" + body

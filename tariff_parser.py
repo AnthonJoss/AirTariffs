@@ -1,6 +1,6 @@
-"""PDF de tarifas aéreas -> filas normalizadas (borrador para revisión).
+"""PDF o Excel de tarifas aéreas -> filas normalizadas (borrador para revisión).
 
-1. pdfplumber extrae el texto del PDF.
+1. pdfplumber extrae el texto del PDF (o openpyxl el de las hojas del Excel).
 2. Un LLM lo convierte a un JSON con esquema fijo (cada cliente envía un formato distinto).
 3. El código mapea los tramos de peso a las columnas de `tariffs` (n, 45, 100, 300, 500, 1000).
 """
@@ -17,9 +17,12 @@ from openai import OpenAI
 import client_profiles
 import client_terms
 import egypt_parser
+import excel_reader
 import tariff_db
+import versions_ai
 
 CACHE_DIR = Path(__file__).parent / "cache"
+SUPPORTED_SUFFIXES = (".pdf",) + excel_reader.EXCEL_SUFFIXES
 MODEL = os.getenv("TARIFF_LLM_MODEL", "gpt-4o")
 
 SYSTEM = """Extraes tarifas aéreas de carga desde el texto de un PDF enviado por una aerolínea o agente.
@@ -30,10 +33,13 @@ Responde SOLO con un JSON válido y COMPACTO (sin espacios ni saltos de línea i
 Cada fila de "rows" es un arreglo: [origen IATA, destino IATA, min, fuel_por_kg, tramos].
 Reglas:
 - Una fila por par origen-destino. Si una línea trae varios destinos con la misma tarifa (ej. "BOM CGK $1.85 ...") o varios orígenes ("ATL/CLT" o "ATL CLT +100 ..." en el encabezado), expande en filas separadas.
+- Encabezados de tramo con "k" ("1k 45k 100k 300k 500k 1000k") son KILOS (1, 45, 100, 300, 500, 1000 kg), no miles: "45k" -> [45,tarifa]. "1k" o "N" es el tramo base [0,tarifa].
 - tramos: cada tramo de peso con su tarifa por kg. "+100" -> [100,tarifa]. "-100", "<100", "N" o "Normal" -> [0,tarifa].
 - min es el cargo mínimo por envío (null si el PDF no lo trae). No lo mezcles con los tramos.
 - fuel es la columna "Fuel x KG" de esa fila (0 si es 0, null si el PDF no tiene esa columna). NO la sumes a las tarifas. Ignora la columna "Rate All in".
 - "origin" es donde sale la carga y "destination" a donde llega. Usa el contexto: "Nonstop uplift from JFK/BOS..." significa que JFK, BOS... son orígenes y la columna/encabezado "To" (FCO, MXP) es el destino; "Station: MIA" en una hoja de tarifas significa origen MIA.
+- Columnas "Via" / "Routing" / "Service": indican la conexión o el tipo de servicio; NO son el origen ni el destino y no se descartan filas por traerlas. El destino de cada fila es su código IATA (columna "Code"/"Destination"); el origen sale del encabezado ("Tariff for NYC ...", "From ..."). Devuelve TODAS las filas de la tabla, también las que van vía otro aeropuerto.
+- Si el origen es una ciudad con aeropuertos entre paréntesis ("NYC (JFK / EWR)", "JFK or EWR"), la tarifa vale para cada uno: genera una fila por aeropuerto listado y por destino (también cuando una fila diga "Direct EWR": el precio es el mismo). El total es (filas de la tabla × aeropuertos de origen): ninguna fila queda con un solo origen. Nunca devuelvas el código de ciudad (NYC).
 - Reporta las tarifas exactamente como están impresas. No inventes datos: usa null si falta. Fechas como 01OCT26 -> 2026-10-01. Si solo se indica un mes ("Promo October 2026"), valid_from es el día 1 y valid_to el último día de ese mes."""
 
 
@@ -71,6 +77,19 @@ def pdf_text(path: Path) -> str:
         text = "\n\n".join((p.extract_text() or "") for p in pdf.pages).strip()
     # Algunos PDFs parten los montos con espacios ("$ 1 20.00", "$ 7 .14"): se reconstruyen.
     return _BROKEN_AMOUNT.sub(lambda m: f"${m.group(1).replace(' ', '')}.{m.group(2)}", text)
+
+
+def source_text(path: Path, sheets: list[str] | None = None) -> tuple[str, list[str] | None]:
+    """(texto, hojas usadas); hojas usadas solo aplica a Excel."""
+    if excel_reader.is_excel(path.name):
+        text, used = excel_reader.excel_text(path, sheets)
+        if not text:
+            raise RuntimeError("El Excel no tiene datos en las hojas elegidas.")
+        return text, used
+    text = pdf_text(path)
+    if not text:
+        raise RuntimeError("El PDF no tiene texto extraíble (¿escaneado?). Requiere OCR.")
+    return text, None
 
 
 def extract_with_llm(text: str, skip_comments: bool = False, context: str = "") -> dict:
@@ -133,20 +152,32 @@ def comments_html(text) -> str:
     return "<p>" + "<br>".join(f"•{l}" for l in lines) + "</p>" if lines else ""
 
 
-def parse_pdf(path: Path, client_id: int | None = None, instructions: str | None = None) -> dict:
-    text = pdf_text(path)
-    if not text:
-        raise RuntimeError("El PDF no tiene texto extraíble (¿escaneado?). Requiere OCR.")
+def parse_file(path: Path, client_id: int | None = None, instructions: str | None = None,
+               sheets: list[str] | None = None) -> dict:
+    """Borrador de tarifas desde un PDF o un Excel (.xlsx/.xlsm); mismo flujo para ambos.
+
+    sheets: solo Excel; hojas a considerar (None = las visibles con datos).
+    """
+    text, used = source_text(path, sheets)
     prof = client_profiles.detect(path.name, text)
     # Términos guardados del cliente elegido en el office o, si no eligió, del detectado
     # (provider y aerolínea del perfil) + instrucciones de esta subida.
     company_ids = [client_id] if client_id else ([prof["provider_id"], prof["airline_id"]] if prof else [])
     terms = tariff_db.get_client_terms(company_ids)
-    context = client_terms.prompt_section(terms, instructions)
+    # Versiones por commodity ("también súbelo como Dangerous con mínimo 100 y +0.50/kg"): las pide
+    # el cliente en sus términos, en las instrucciones o el propio documento. Se detectan primero y su
+    # frase se quita de lo que lee el LLM de las filas. Es un extra: si falla no se pierde el análisis.
+    try:
+        versions, versions_error = versions_ai.detect(terms, instructions, text[:4000]), None
+    except Exception as e:  # noqa: BLE001
+        versions, versions_error = [], f"{type(e).__name__}: {e}"
+    read_terms, read_instructions = versions_ai.strip_sources(terms, instructions, versions)
+    context = client_terms.prompt_section(read_terms, read_instructions)
     # EgyptAir tiene formato fijo: parser determinista (instantáneo, sin LLM); si no cuadra, cae al
     # LLM. Los términos guardados no lo fuerzan: sus fees viven en air_fee_rules (los aplica el
     # office/backend sin IA). Solo instrucciones extra de esta subida pasan por el LLM.
-    use_fixed = prof and prof["name"] == "EgyptAir" and not (instructions or "").strip()
+    use_fixed = prof and prof["name"] == "EgyptAir" and not (read_instructions or "").strip()
+    # El parser fijo lee las líneas del PDF; con un Excel no cuadra y cae al LLM.
     data = egypt_parser.parse_egypt(text) if use_fixed else None
     if data is None:
         data = extract_with_llm(text, skip_comments=bool(prof and prof.get("comments")), context=context)
@@ -157,7 +188,12 @@ def parse_pdf(path: Path, client_id: int | None = None, instructions: str | None
             r["fuel"] = None
     data["comments"] = comments_html(data.get("comments"))
     data["profile"] = prof
+    if used is not None:
+        data["excel"] = {"sheets": excel_reader.sheets_info(path), "used": used}
     data["ai_context"] = client_terms.summary(terms, instructions)
+    data["versions"] = versions
+    if versions_error:
+        data["versions_error"] = versions_error
     if prof and not context:
         data["comments"] = prof.get("comments", data["comments"])
     elif prof and prof.get("comments"):

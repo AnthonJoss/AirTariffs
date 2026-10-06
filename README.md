@@ -16,9 +16,11 @@ office_tms ─► tmsbackendnew (TariffUploadController, solo Admin) ─► AirT
 | Archivo | Rol |
 |---|---|
 | `main.py` | API (FastAPI) y middleware `X-Api-Key`. |
-| `tariff_parser.py` | PDF → texto → LLM (formato compacto, cache en `cache/`) → columnas `n/w45/w100/w300/w500/w1000`. |
+| `tariff_parser.py` | PDF o Excel → texto → LLM (formato compacto, cache en `cache/`) → columnas `n/w45/w100/w300/w500/w1000`. |
+| `excel_reader.py` | Excel (.xlsx/.xlsm) → texto (una fila por línea, celdas con ` \| `): hojas, filas filtradas, tope de caracteres. |
+| `versions_ai.py` | Detecta "súbelo también como otro commodity" (mínimo y +USD/kg o %) en términos, instrucciones o documento. |
 | `client_profiles.py` | Perfiles fijos por cliente (provider/airline, fees, fuel_fee_id, comentarios, reglas de MIN). |
-| `client_terms.py` | Términos/instrucciones por cliente: extracción de texto de PDF/TXT y sección del prompt. |
+| `client_terms.py` | Términos/instrucciones por cliente: extracción de texto de PDF/TXT/MD/CSV/Excel y sección del prompt. |
 | `egypt_parser.py` | Parser determinista de EgyptAir (sin LLM; si hay términos se usa el LLM). |
 | `tariff_db.py` | Acceso a MySQL (catálogos, insert transaccional, términos). |
 | `db_conn.py` | Conexión por perfil (`MYSQL_PROFILE` local/remote, `MYSQL_*_OVERRIDE`). |
@@ -32,9 +34,10 @@ Ejemplos en `test_main.http`.
 | Método | Ruta | Descripción |
 |---|---|---|
 | GET | `/` | Health check. |
-| POST | `/tariffs/parse` | Multipart `file` (PDF), `client_id` (opcional), `instructions` (opcional) → borrador `{airline, valid_to, comments, rows[], profile, ai_context}`. No inserta. |
+| POST | `/tariffs/parse` | Multipart `file` (**PDF o Excel .xlsx/.xlsm**), `client_id` (opcional), `instructions` (opcional), `sheets` (opcional, solo Excel: JSON con las hojas a leer) → borrador `{airline, valid_to, comments, rows[], profile, ai_context, versions[], excel{sheets,used}}`. No inserta. |
+| POST | `/tariffs/excel-sheets` | Multipart `file` (Excel) → `{sheets:[{name, visible, rows, hidden_rows, chars, selected}]}` para elegir qué hojas leer. No analiza. |
 | GET | `/tariffs/terms?company_id=` | Términos guardados de una empresa (`instructions`, `files[]` con nombre/tamaño, `updated_by/at`). |
-| POST | `/tariffs/terms` | Multipart `company_id`, `company_name`, `instructions`, `keep` (JSON con nombres a conservar), `files` (PDF/TXT/MD/CSV), `updated_by`. |
+| POST | `/tariffs/terms` | Multipart `company_id`, `company_name`, `instructions`, `keep` (JSON con nombres a conservar), `files` (PDF/TXT/MD/CSV/Excel), `sheets` (JSON `{archivo: [hojas]}`), `updated_by`. |
 | POST | `/tariffs/rules/draft` | JSON `{airline_id, company_ids[], text}` → `{rules[], skipped[], sources}`: reglas de fees propuestas por el LLM desde los términos guardados (`fee_rules_ai.py`, cache por hash). No guarda. |
 | GET | `/tariffs/companies?q=` | Empresas por nombre. |
 | GET | `/tariffs/fees` | Catálogo de fees (aéreos primero). |
@@ -42,9 +45,26 @@ Ejemplos en `test_main.http`.
 | POST | `/tariffs/insert` | `{header, rows}` en una transacción. |
 | GET | `/tariffs-ui`, `/mails-ui`, `/mails`, `/mails/download` | Pantallas/utilidades locales. |
 
+## Excel
+
+`excel_reader.py` lee las hojas **visibles con datos** (o las que se pidan en `sheets`, también ocultas):
+una fila por línea, celdas separadas por ` | `, valores calculados (`data_only`). Las **filas y columnas
+ocultas por un filtro se leen siempre** (el filtro es una vista). Tope `TARIFF_EXCEL_MAX_CHARS`
+(60.000): con hojas por defecto las que no caben se omiten; con hojas elegidas, si no caben es un error.
+Un Excel entra al mismo flujo que el PDF (perfil, términos, cache). El parser fijo de EgyptAir lee
+líneas de PDF: con un Excel cae al LLM.
+
+## Versiones por commodity
+
+`versions_ai.detect` busca (solo si el texto menciona algo parecido) una orden explícita de subir las
+mismas tarifas con otro commodity: `[{commodity, mode: surcharge|pct|same, amount, min, source_text}]`.
+La frase se quita de lo que lee el LLM de las filas (`strip_sources`) para no confundirlo. El office la
+deja en "Also upload as another commodity" con la etiqueta *From the terms*. Si falla no se pierde el
+análisis (`versions_error`).
+
 ## Análisis de un PDF
 
-1. `pdfplumber` extrae el texto (montos partidos como `$ 1 20.00` se reconstruyen).
+1. `pdfplumber` extrae el texto del PDF (montos partidos como `$ 1 20.00` se reconstruyen); un Excel pasa por `excel_reader`.
 2. `client_profiles.detect()` reconoce al cliente (nombre de archivo/texto).
 3. **Términos:** se leen de `airtariff_client_terms` los del `client_id` recibido o, si no
    vino, los del provider/airline del perfil; más `instructions`. Van al system prompt
@@ -54,6 +74,9 @@ Ejemplos en `test_main.http`.
    por hash de modelo + prompt + texto.
 5. Tramos → columnas: tramo más alto ≤ el requerido; si no hay, el más bajo.
 6. Se marcan aeropuertos que no existen en `transports` (`unknown`).
+
+Reglas del prompt: *Via/Routing/Service* no son origen ni destino; un origen que es una ciudad con
+aeropuertos (`NYC (JFK / EWR)`) genera una fila por aeropuerto; encabezados `45k`/`100k` son kilos.
 
 ## Insert
 

@@ -106,3 +106,35 @@ POST http://127.0.0.1:8001/tariffs/rules/draft
 Content-Type: application/json
 
 {"airline_id": 8296, "company_ids": [8265], "text": "Transit Shipment Fee: $.05/kg with a $25.00 min (not applicable for Final destination CAI)."}
+
+###
+
+### Hojas de un Excel (para elegir cuáles leer)
+POST http://127.0.0.1:8001/tariffs/excel-sheets
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="rates.xlsx"
+
+< ./excels/ITA PROMO_Jan_ 2026.xlsx
+--WebAppBoundary--
+
+###
+
+### Analiza un Excel leyendo solo algunas hojas (sheets = JSON con sus nombres)
+POST http://127.0.0.1:8001/tariffs/parse
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="rates.xlsx"
+
+< ./excels/ITA PROMO_Jan_ 2026.xlsx
+--WebAppBoundary
+Content-Disposition: form-data; name="sheets"
+
+["Table 3"]
+--WebAppBoundary
+Content-Disposition: form-data; name="instructions"
+
+Also upload this file as Dangerous Goods, with a minimum of 100 and +0.50 per kg.
+--WebAppBoundary--
