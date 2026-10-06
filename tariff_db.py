@@ -14,12 +14,17 @@ DEFAULT_USER_ID = 1
 DEFAULT_COMMODITY_ID = 4  # Freight of All Kind
 
 
-def search_companies(q: str, limit: int = 15):
+def search_companies(q: str, limit: int = 15, type_id: int | None = None):
+    """Empresas por nombre. type_id filtra por tipo (company_types.type_id): 6 = Air Carrier."""
+    sql = "SELECT c.id, c.fullname FROM companies c WHERE c.fullname LIKE %s"
+    params: list = [f"%{q}%"]
+    if type_id is not None:
+        sql += " AND EXISTS (SELECT 1 FROM company_types ct WHERE ct.company_id = c.id AND ct.type_id = %s)"
+        params.append(type_id)
+    sql += " ORDER BY c.fullname LIMIT %s"
+    params.append(limit)
     with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, fullname FROM companies WHERE fullname LIKE %s ORDER BY fullname LIMIT %s",
-            (f"%{q}%", limit),
-        )
+        cur.execute(sql, params)
         return [{"id": i, "name": n} for i, n in cur.fetchall()]
 
 
@@ -96,8 +101,18 @@ def air_fee_ids() -> set[int]:
 
 
 def commodities():
+    """Commodities de carga aérea: `commodities.mode = 'air'` (GEN, DG, PER, AVI, PIL).
+
+    La tabla es compartida con marítimo; esos no se ofrecen acá. Si la columna `mode`
+    aún no existe en la BD (SQL de Cloud SQL sin aplicar) se devuelven todos, como antes.
+    """
     with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, fullname FROM commodities ORDER BY fullname")
+        try:
+            cur.execute("SELECT id, fullname FROM commodities WHERE mode = 'air' ORDER BY fullname")
+        except mysql.connector.errors.ProgrammingError as e:
+            if e.errno != 1054:  # 1054 = Unknown column
+                raise
+            cur.execute("SELECT id, fullname FROM commodities ORDER BY fullname")
         return [{"id": i, "name": n} for i, n in cur.fetchall()]
 
 

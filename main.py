@@ -192,8 +192,9 @@ async def rules_draft(body: RulesDraftRequest):
 
 
 @app.get("/tariffs/companies")
-async def tariff_companies(q: str):
-    return await run_in_threadpool(tariff_db.search_companies, q)
+async def tariff_companies(q: str, type: int | None = None):
+    """`type` opcional: tipo de empresa (types.id), p. ej. 6 = Air Carrier para el campo Airline."""
+    return await run_in_threadpool(tariff_db.search_companies, q, 15, type)
 
 
 @app.get("/tariffs/fees")
