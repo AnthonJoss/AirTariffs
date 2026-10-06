@@ -11,11 +11,13 @@ Air fare/tariff REST API built with FastAPI (single module: `main.py`). Dependen
 
 ## Subida de tarifas (PDF → MySQL)
 
-- Flujo: `/tariffs-ui` sube el PDF → `tariff_parser.py` (pdfplumber + OpenAI + perfiles por cliente en `client_profiles.py`) → pantalla de revisión → `tariff_db.insert_tariffs` (una transacción) en `tariffs`.
+- Flujo: `/tariffs-ui` sube el PDF **o Excel (.xlsx/.xlsm)** → `tariff_parser.py` (pdfplumber / `excel_reader.py` + OpenAI + perfiles por cliente en `client_profiles.py`) → pantalla de revisión → `tariff_db.insert_tariffs` (una transacción) en `tariffs`.
 - Requiere `OPENAI_API_KEY` (gpt-4o) (env o `.env`). La BD usa `db_conn.py`, perfil `local` por defecto (no cambiar a `remote` sin pedirlo).
 - Mapeo de tramos de peso → columnas `n/forty_five_more/hundred_more/three_hundred_more/five_hundred_more/thousand_more`: tramo más alto ≤ el requerido, si no hay el más bajo (misma regla que MailReader `analizar_egypt.py`).
 - Fees (`tariff_feeds`, USD/kg): `header.fees` van a todas las filas; `rows[].fees` solo a esa fila (fees individuales del office); `fuel_fee_id` + columna fuel por fila.
-- Términos por cliente (`client_terms.py`, tabla `airtariff_client_terms`, creada desde el backend): instrucciones + texto de archivos PDF/TXT por `company_id`; `/tariffs/parse` los mete en el prompt (cliente elegido `client_id` o provider/airline del perfil) + `instructions` extra. `GET/POST /tariffs/terms`.
+- Excel: `excel_reader.py` (hojas visibles con datos o las de `sheets`; las filas ocultas por filtro SE leen); `POST /tariffs/excel-sheets` lista las hojas. Términos y tarifas aceptan Excel.
+- Versiones por commodity (`versions_ai.py`): "súbelo también como Dangerous con mínimo 100 y +0.50/kg" en términos/instrucciones/documento → `versions[]` en el borrador; su frase se quita del prompt de filas.
+- Términos por cliente (`client_terms.py`, tabla `airtariff_client_terms`, creada desde el backend): instrucciones + texto de archivos PDF/TXT/MD/CSV/Excel por `company_id`; `/tariffs/parse` los mete en el prompt (cliente elegido `client_id` o provider/airline del perfil) + `instructions` extra. `GET/POST /tariffs/terms`.
 - Reglas de fees por aerolínea (`air_fee_rules`, del backend): `POST /tariffs/rules/draft` (`fee_rules_ai.py`) las propone con el LLM desde los términos guardados; no guarda nada. Las reglas no se copian a `tariff_feeds` (las aplica el backend al cotizar); el insert solo recibe fees simples por kg.
 - Gmail: `python gmail_client.py` autoriza una vez; `/mails-ui` baja PDFs a `pdfs/`.
 

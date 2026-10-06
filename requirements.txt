@@ -7,3 +7,4 @@ google-auth-oauthlib
 pdfplumber
 mysql-connector-python
 openai
+openpyxl
