@@ -38,6 +38,8 @@ PROFILES = [
         "comments": EGYPT_COMMENTS,
         # Los PDFs nuevos no traen columna MIN; en los Excel MIN = 100 kg x tarifa de +100 (240 = 100 x 2.4)
         "min_rule": "100kg_x_rate100",
+        # Sus PDFs no traen tramo base (+100 +250 +500…): en los Excel históricos N = 45 = 100 = tarifa de +100.
+        "n_from_lowest": True,
     },
     {
         "name": "ITA Airways",

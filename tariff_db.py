@@ -4,6 +4,7 @@ import os
 
 import mysql.connector
 
+import upload_history
 from db_conn import db_conn
 
 # En Cloud Run MYSQL_PROFILE=remote (Cloud SQL); en local queda "local".
@@ -116,6 +117,30 @@ def commodities():
         return [{"id": i, "name": n} for i, n in cur.fetchall()]
 
 
+def create_commodity(name: str) -> dict:
+    """Crea un commodity de carga aérea (`commodities.mode = 'air'`) o devuelve el que ya existe con ese nombre.
+
+    Sirve para libros con una hoja por producto (Emirates: AOG, VAL, MUW…) cuyos productos no están en el
+    catálogo. Solo se compara contra los commodities aéreos: uno marítimo con el mismo nombre no se toca.
+    """
+    name = " ".join((name or "").split())
+    if not 2 <= len(name) <= 60:
+        raise ValueError("The commodity name must have between 2 and 60 characters.")
+    with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
+        try:
+            cur.execute("SELECT id, fullname FROM commodities WHERE mode = 'air' AND LOWER(fullname) = LOWER(%s) LIMIT 1", (name,))
+        except mysql.connector.errors.ProgrammingError as e:
+            if e.errno == 1054:  # la columna `mode` aún no existe
+                raise RuntimeError("commodities.mode does not exist yet: apply the SQL of the air commodities first.") from e
+            raise
+        row = cur.fetchone()
+        if row:
+            return {"id": row[0], "name": row[1], "created": False}
+        cur.execute("INSERT INTO commodities (fullname, valid, mode) VALUES (%s, 1, 'air')", (name,))
+        conn.commit()
+        return {"id": cur.lastrowid, "name": name, "created": True}
+
+
 def transport_ids(codes) -> dict[str, int]:
     codes = sorted({c for c in codes if c})
     if not codes:
@@ -185,13 +210,16 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
 
     fees = header.get("fees") or []
     fuel_fee_id = header.get("fuel_fee_id")
+    upload_history.ensure_table()  # antes de la transaccion: un CREATE TABLE haria commit implicito
     fee_count = 0
+    tariff_ids: list[int] = []
     with db_conn(PROFILE, pooled=False) as conn:
         cur = conn.cursor()
         try:
             for row, vals in zip(rows, data):
                 cur.execute(INSERT_SQL, vals)
                 tariff_id = cur.lastrowid
+                tariff_ids.append(tariff_id)
                 # Fees generales (header, todas las filas) + individuales de esta fila.
                 row_fees = [
                     (f["fee_id"], f.get("fee_comment"), f["cost_unit"])
@@ -202,10 +230,12 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
                 for fee_id, comment, cost in row_fees:
                     cur.execute(FEE_SQL, (fee_id, comment, cost, cost, tariff_id))
                     fee_count += 1
+            # Historial del upload (para poder revertirlo) en la MISMA transaccion: o entra todo o nada.
+            batch_id = upload_history.record_upload(cur, header, tariff_ids, fee_count)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         finally:
             cur.close()
-    return {"tariffs": len(data), "fees": fee_count}
+    return {"tariffs": len(data), "fees": fee_count, "batch_id": batch_id, "tracked": batch_id is not None}

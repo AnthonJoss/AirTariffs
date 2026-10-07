@@ -138,3 +138,24 @@ Content-Disposition: form-data; name="instructions"
 
 Also upload this file as Dangerous Goods, with a minimum of 100 and +0.50 per kg.
 --WebAppBoundary--
+
+###
+
+### Historial de uploads (un archivo = un lote)
+GET http://127.0.0.1:8001/tariffs/uploads?limit=10
+
+###
+
+### Qué pasaría al revertir un upload (dry_run: no toca nada)
+POST http://127.0.0.1:8001/tariffs/uploads/revert
+Content-Type: application/json
+
+{"batch_id": "REEMPLAZAR-POR-EL-batch_id", "dry_run": true}
+
+###
+
+### Revertir un upload (borra lo no usado, desactiva lo ya usado en cotizaciones)
+POST http://127.0.0.1:8001/tariffs/uploads/revert
+Content-Type: application/json
+
+{"batch_id": "REEMPLAZAR-POR-EL-batch_id", "reverted_by": "Franco"}
