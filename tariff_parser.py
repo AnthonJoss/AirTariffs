@@ -210,6 +210,7 @@ def to_columns(row: dict, fill_n: bool = False) -> dict:
     else:
         n_rate = min(br, key=lambda b: b["from_kg"])["rate"] if (br and fill_n) else None
     return {
+        **({"note": row["note"]} if row.get("note") else {}),
         "origin": (row.get("origin") or "").upper(),
         "destination": (row.get("destination") or "").upper(),
         "min": row.get("min"),
@@ -229,16 +230,18 @@ def comments_html(text) -> str:
 
 
 def parse_file(path: Path, client_id: int | None = None, instructions: str | None = None,
-               sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None) -> dict:
+               sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None,
+               label_column: str | None = None) -> dict:
     """Borrador de tarifas desde un PDF o un Excel (.xlsx/.xlsm); mismo flujo para ambos.
 
     sheets: solo Excel; hojas a considerar (None = las visibles con datos).
     row_filter: solo Excel con tabla reconocida; {columna: [valores]} para cargar solo esas filas.
+    label_column: solo Excel con tabla; columna cuyo valor (nombre del producto) se guarda en los comentarios de cada tarifa.
 
     Un Excel con una tabla reconocida (encabezado de tramos + columnas de origen y destino) se lee SIN el
     modelo, fila por fila y sin tope (excel_table); el modelo solo lee los metadatos (aerolínea, vigencia).
     """
-    table = excel_reader.table_read(path, sheets, row_filter) if excel_reader.is_excel(path.name) else None
+    table = excel_reader.table_read(path, sheets, row_filter, label_column) if excel_reader.is_excel(path.name) else None
     if row_filter and not table:
         raise ValueError("The row filters need a sheet with a recognized rate table.")
     if table:

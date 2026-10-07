@@ -242,8 +242,18 @@ def _wanted_rows(t: Table, row_filter: dict[str, list[str]] | None) -> list[int]
     return [i for i in t.data if all(t.cell(i, c) in allowed for c, allowed in checks)]
 
 
-def extract(t: Table, row_filter: dict[str, list[str]] | None = None) -> list[dict]:
-    """Filas del borrador (mismo formato que devuelve el LLM), una por aeropuerto de origen."""
+def extract(t: Table, row_filter: dict[str, list[str]] | None = None, label_column: str | None = None) -> list[dict]:
+    """Filas del borrador (mismo formato que devuelve el LLM), una por aeropuerto de origen.
+
+    `label_column`: columna cuyo valor se conserva en cada fila como `note` (el nombre del producto del
+    archivo, p. ej. "AC DGR - Standard"): se guarda en los comentarios de cada tarifa aunque varios
+    productos compartan commodity.
+    """
+    label_idx = None
+    if label_column:
+        label_idx = next((i for i, c in enumerate(t.columns) if c.casefold().strip() == label_column.casefold().strip()), None)
+        if label_idx is None:
+            raise ValueError(f"The column “{label_column}” is not in the sheet “{t.sheet}”.")
     out: list[dict] = []
     for i in _wanted_rows(t, row_filter):
         row = t.rows[i]
@@ -251,6 +261,7 @@ def extract(t: Table, row_filter: dict[str, list[str]] | None = None) -> list[di
         breaks = [{"from_kg": tier, "rate": get(c)} for tier, c in zip(t.tiers, t.tier_cols) if get(c) is not None]
         mn = get(t.min_col)
         fuel = get(t.fuel_col) if t.fuel_col is not None else None
+        note = t.cell(i, label_idx) if label_idx is not None else ""
         for origin in t.origins(t.cell(i, t.origin_col)):
             out.append({
                 "origin": origin,
@@ -258,6 +269,7 @@ def extract(t: Table, row_filter: dict[str, list[str]] | None = None) -> list[di
                 "min": mn,
                 "fuel_per_kg": fuel,
                 "breaks": [dict(b) for b in breaks],
+                **({"note": note} if note else {}),
             })
     return out
 

@@ -1,4 +1,5 @@
 """Acceso a MySQL para tarifas aéreas (usa db_conn.py, perfil local por defecto)."""
+import html
 import json
 import os
 
@@ -187,6 +188,16 @@ VALUES (%s, %s, 1, %s, %s, %s)
 """
 
 
+def row_comments(header_comments, note) -> str | None:
+    """Comentarios de una tarifa: el nombre de su producto en el archivo ("Product: AC DGR - Standard") y,
+    después, los comentarios generales del archivo. Así el nombre queda en CADA tarifa aunque varios
+    productos compartan commodity, y el buscador de tarifas lo muestra (AirTariffSearch::productNote)."""
+    note = " ".join(str(note or "").split())[:120]
+    if not note:
+        return header_comments
+    return f"<p>•Product: {html.escape(note)}</p>" + (header_comments or "")
+
+
 def insert_tariffs(header: dict, rows: list[dict]) -> dict:
     """Inserta todas las filas en una sola transacción (todo o nada)."""
     ids = transport_ids([r["origin"] for r in rows] + [r["destination"] for r in rows])
@@ -201,7 +212,7 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
             raise ValueError(f"{r['origin']}-{r['destination']}: falta el MIN")
         data.append((
             ids[r["origin"]], ids[r["destination"]], header["provider_id"], header["airline_id"],
-            header["commodity_id"], round(float(r["min"]) + adj), r["n"], header.get("comments"),
+            header["commodity_id"], round(float(r["min"]) + adj), r["n"], row_comments(header.get("comments"), r.get("note")),
             header.get("user_id", DEFAULT_USER_ID), TYPE_TARIFF_AIR,
             r["w45"], r["w100"], r["w300"], r["w500"], r["w1000"],
             header["valid_to"],

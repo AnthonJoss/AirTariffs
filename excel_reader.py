@@ -90,7 +90,8 @@ def sheets_info(source, with_matrix: bool = True) -> list[dict]:
     return out
 
 
-def table_read(source, sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None) -> dict | None:
+def table_read(source, sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None,
+               label_column: str | None = None) -> dict | None:
     """Lectura directa de las hojas que son una tabla de tarifas (sin LLM, sin tope de filas).
 
     Devuelve {rows, meta_text, used, other, lines, tariffs}: `other` son las hojas elegidas que NO se
@@ -115,7 +116,7 @@ def table_read(source, sheets: list[str] | None = None, row_filter: dict[str, li
                 if text_lines and (explicit or tier_headers.expected_rows("\n".join(text_lines))):
                     other.append(ws.title)
                 continue
-            got = excel_table.extract(t, row_filter)
+            got = excel_table.extract(t, row_filter, label_column)
             rows += got
             lines += len(excel_table._wanted_rows(t, row_filter))
             metas.append(excel_table.meta_text(t))

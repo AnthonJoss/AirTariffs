@@ -88,8 +88,9 @@ async def mails_ui():
 # ---------------- Tarifas: upload -> revisión -> insert ----------------
 
 def _draft(path: Path, client_id: int | None = None, instructions: str | None = None,
-           sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None) -> dict:
-    data = tariff_parser.parse_file(path, client_id, instructions, sheets, row_filter)
+           sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None,
+           label_column: str | None = None) -> dict:
+    data = tariff_parser.parse_file(path, client_id, instructions, sheets, row_filter, label_column)
     ids = tariff_db.transport_ids([r["origin"] for r in data["rows"]] + [r["destination"] for r in data["rows"]])
     for r in data["rows"]:
         r["unknown"] = [c for c in (r["origin"], r["destination"]) if c not in ids]
@@ -108,6 +109,7 @@ async def parse_tariff_pdf(
     instructions: str | None = Form(None),
     sheets: str | None = Form(None),
     row_filter: str | None = Form(None),
+    label_column: str | None = Form(None),
 ):
     """Sube un PDF o Excel (.xlsx/.xlsm) y devuelve el borrador extraído (NO inserta nada).
 
@@ -115,6 +117,7 @@ async def parse_tariff_pdf(
     instructions: instrucciones extra solo para este análisis.
     sheets: JSON con los nombres de las hojas a leer (solo Excel; vacío = las visibles con datos).
     row_filter: JSON {columna: [valores]} (solo Excel con tabla): carga únicamente las filas que cumplan.
+    label_column: columna (solo Excel con tabla) cuyo valor se guarda como `note` en cada fila → comentarios de la tarifa.
     """
     if not (file.filename or "").lower().endswith(tariff_parser.SUPPORTED_SUFFIXES):
         raise HTTPException(400, "Solo PDF o Excel (.xlsx, .xlsm)")
@@ -131,7 +134,7 @@ async def parse_tariff_pdf(
         if filters is not None and not (isinstance(filters, dict) and all(
                 isinstance(v, list) for v in filters.values())):
             raise ValueError("row_filter must be a JSON object {column: [values]}.")
-        return await run_in_threadpool(_draft, dest, client_id, instructions, sheet_names, filters)
+        return await run_in_threadpool(_draft, dest, client_id, instructions, sheet_names, filters, label_column or None)
     except Exception as e:
         raise HTTPException(422, f"{type(e).__name__}: {e}")
     finally:
