@@ -1,6 +1,8 @@
 import hmac
 import json
 import os
+import shutil
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -15,6 +17,7 @@ import fee_rules_ai
 import gmail_client
 import tariff_db
 import tariff_parser
+import upload_history
 
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 
@@ -113,14 +116,20 @@ async def parse_tariff_pdf(
     """
     if not (file.filename or "").lower().endswith(tariff_parser.SUPPORTED_SUFFIXES):
         raise HTTPException(400, "Solo PDF o Excel (.xlsx, .xlsm)")
-    UPLOAD_DIR.mkdir(exist_ok=True)
-    dest = UPLOAD_DIR / Path(file.filename).name
+    # Una carpeta por petición: varias tarjetas del MISMO archivo (una por hoja de un Excel) llegan a la vez
+    # con el mismo nombre; si compartieran ruta una sobrescribiría el archivo mientras otra lo lee
+    # (BadZipFile: Truncated file header). El nombre se conserva (la detección de cliente lo usa).
+    request_dir = UPLOAD_DIR / uuid.uuid4().hex
+    request_dir.mkdir(parents=True, exist_ok=True)
+    dest = request_dir / Path(file.filename).name
     dest.write_bytes(await file.read())
     try:
         sheet_names = json.loads(sheets) if sheets else None
         return await run_in_threadpool(_draft, dest, client_id, instructions, sheet_names)
     except Exception as e:
         raise HTTPException(422, f"{type(e).__name__}: {e}")
+    finally:
+        shutil.rmtree(request_dir, ignore_errors=True)
 
 
 @app.post("/tariffs/excel-sheets")
@@ -227,6 +236,21 @@ async def tariff_commodities():
     return await run_in_threadpool(tariff_db.commodities)
 
 
+class NewCommodity(BaseModel):
+    name: str
+
+
+@app.post("/tariffs/commodities")
+async def create_commodity(body: NewCommodity):
+    """Crea un commodity de carga aérea (o devuelve el existente con ese nombre)."""
+    try:
+        return await run_in_threadpool(tariff_db.create_commodity, body.name)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
 class InsertRequest(BaseModel):
     header: dict
     rows: list[dict]
@@ -240,6 +264,74 @@ async def insert_tariffs(body: InsertRequest):
     except ValueError as e:
         raise HTTPException(422, str(e))
     return n
+
+
+# ---------------- Historial de uploads y reversa ----------------
+
+@app.get("/tariffs/uploads")
+async def list_uploads(limit: int = 30):
+    """Últimos uploads (un archivo = un lote, con sus versiones por commodity)."""
+    return await run_in_threadpool(upload_history.list_uploads, max(1, min(limit, 100)))
+
+
+class RevertRequest(BaseModel):
+    batch_id: str
+    reverted_by: str | None = None
+    # True: solo cuenta qué pasaría (para mostrarlo antes de confirmar), sin tocar nada.
+    dry_run: bool = False
+
+
+@app.post("/tariffs/uploads/revert")
+async def revert_upload(body: RevertRequest):
+    """Revierte un upload: borra sus tarifas y fees; las ya usadas en cotizaciones las desactiva."""
+    try:
+        return await run_in_threadpool(upload_history.revert_batch, body.batch_id, body.reverted_by, body.dry_run)
+    except upload_history.BatchNotFound:
+        raise HTTPException(404, "That upload is not in the history.")
+    except upload_history.AlreadyReverted:
+        raise HTTPException(409, "That upload was already reverted.")
+    except upload_history.TrackingUnavailable as e:
+        raise HTTPException(503, str(e))
+
+
+class EditRequest(BaseModel):
+    batch_ids: list[str]
+    # airline_id, provider_id, commodity_id, valid_to (YYYY-MM-DD), airchaft (1 CAO, 2 PAX, 3 ambos); vacío = no cambia
+    changes: dict
+    edited_by: str | None = None
+    dry_run: bool = False
+
+
+@app.post("/tariffs/uploads/edit")
+async def edit_uploads(body: EditRequest):
+    """Corrige aerolínea / proveedor / commodity / vigencia / avión de todas las tarifas de esos uploads."""
+    try:
+        return await run_in_threadpool(
+            upload_history.edit_batches, body.batch_ids, body.changes, body.edited_by, body.dry_run
+        )
+    except upload_history.BatchNotFound as e:
+        raise HTTPException(404, f"Upload not in the history: {e}")
+    except upload_history.EditNotAllowed as e:
+        raise HTTPException(422, str(e))
+    except upload_history.TrackingUnavailable as e:
+        raise HTTPException(503, str(e))
+
+
+class AttachRulesRequest(BaseModel):
+    batch_id: str
+    rule_ids: list[int]
+
+
+@app.post("/tariffs/uploads/rules")
+async def attach_upload_rules(body: AttachRulesRequest):
+    """Asocia a un upload las reglas de fees (air_fee_rules) que creó, para borrarlas si se revierte."""
+    try:
+        n = await run_in_threadpool(upload_history.attach_rules, body.batch_id, body.rule_ids)
+    except upload_history.BatchNotFound:
+        raise HTTPException(404, "That upload is not in the history.")
+    except upload_history.TrackingUnavailable as e:
+        raise HTTPException(503, str(e))
+    return {"batch_id": body.batch_id, "rules": n}
 
 
 @app.get("/tariffs-ui", response_class=HTMLResponse)

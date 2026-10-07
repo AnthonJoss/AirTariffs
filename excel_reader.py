@@ -11,6 +11,8 @@ from pathlib import Path
 
 import openpyxl
 
+import tier_headers
+
 EXCEL_SUFFIXES = (".xlsx", ".xlsm")
 # Tope de texto por archivo (~15k tokens). Los libros de trabajo traen hojas auxiliares enormes
 # (fórmulas que arman INSERTs, copias de la tarifa).
@@ -63,12 +65,17 @@ def sheets_info(source) -> list[dict]:
     for ws in wb.worksheets:
         lines, hidden = _lines(ws)
         visible = ws.sheet_state == "visible"
+        # ¿Es una tabla de tarifas? (encabezado `Min +45 +100 …` y líneas de datos). Un libro con una hoja
+        # por producto/commodity mezcla hojas de tarifas con hojas de condiciones comerciales.
+        data_rows = tier_headers.expected_rows("\n".join(lines)) or 0
         out.append({
             "name": ws.title,
             "visible": visible,
             "rows": len(lines),
             "hidden_rows": hidden,
             "chars": sum(len(l) + 1 for l in lines),
+            "data_rows": data_rows,
+            "has_rates": data_rows > 0,
             "selected": visible and bool(lines),
         })
     wb.close()

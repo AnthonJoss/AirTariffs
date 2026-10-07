@@ -19,6 +19,7 @@ import client_terms
 import egypt_parser
 import excel_reader
 import tariff_db
+import tier_headers
 import versions_ai
 
 CACHE_DIR = Path(__file__).parent / "cache"
@@ -35,6 +36,7 @@ Reglas:
 - Una fila por par origen-destino. Si una línea trae varios destinos con la misma tarifa (ej. "BOM CGK $1.85 ...") o varios orígenes ("ATL/CLT" o "ATL CLT +100 ..." en el encabezado), expande en filas separadas.
 - Encabezados de tramo con "k" ("1k 45k 100k 300k 500k 1000k") son KILOS (1, 45, 100, 300, 500, 1000 kg), no miles: "45k" -> [45,tarifa]. "1k" o "N" es el tramo base [0,tarifa].
 - tramos: cada tramo de peso con su tarifa por kg. "+100" -> [100,tarifa]. "-100", "<100", "N" o "Normal" -> [0,tarifa].
+- Cada columna de tarifa del encabezado es UN tramo con SU propio from_kg, tal cual está impreso: `Min +45 +100 +300 +500 +1000` -> [45,..],[100,..],[300,..],[500,..],[1000,..]. NUNCA inventes un tramo base [0] ni corras las columnas: el tramo base [0] existe SOLO si hay una columna explícita N / Normal / Base / "-X" / "<X" / "1k". Devuelve tantos tramos como columnas de tarifa tenga el encabezado.
 - min es el cargo mínimo por envío (null si el PDF no lo trae). No lo mezcles con los tramos.
 - fuel es la columna "Fuel x KG" de esa fila (0 si es 0, null si el PDF no tiene esa columna). NO la sumes a las tarifas. Ignora la columna "Rate All in".
 - "origin" es donde sale la carga y "destination" a donde llega. Usa el contexto: "Nonstop uplift from JFK/BOS..." significa que JFK, BOS... son orígenes y la columna/encabezado "To" (FCO, MXP) es el destino; "Station: MIA" en una hoja de tarifas significa origen MIA.
@@ -92,32 +94,67 @@ def source_text(path: Path, sheets: list[str] | None = None) -> tuple[str, list[
     return text, None
 
 
-def extract_with_llm(text: str, skip_comments: bool = False, context: str = "") -> dict:
-    # context: términos/instrucciones del cliente (client_terms.prompt_section).
-    system = SYSTEM + (NO_COMMENTS if skip_comments and not context else "") + context
-    # Misma entrada + mismas instrucciones + mismo modelo = misma respuesta: se reutiliza del disco.
-    key = hashlib.sha256("\n".join([MODEL, system, text]).encode()).hexdigest()
-    cache_file = CACHE_DIR / f"{key}.json"
-    if cache_file.exists():
-        return json.loads(cache_file.read_text(encoding="utf-8"))
+MAX_ATTEMPTS = 3
+# Un archivo con muchas más líneas que esto no cabe en la respuesta del modelo (se cortaría el JSON).
+MAX_EXPECTED_ROWS = 320
 
+
+def _call_llm(system: str, text: str, nudge: str = "") -> dict:
     _load_env()
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("Falta OPENAI_API_KEY (variable de entorno o archivo .env).")
     resp = OpenAI().chat.completions.create(
         model=MODEL,
         temperature=0,
+        seed=7,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system},
-            {"role": "user", "content": text},
+            {"role": "user", "content": text + nudge},
         ],
     )
     data = json.loads(resp.choices[0].message.content)
     data["rows"] = expand_rows(data.get("rows", []))
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_file.write_text(json.dumps(data), encoding="utf-8")
     return data
+
+
+def extract_with_llm(text: str, skip_comments: bool = False, context: str = "") -> dict:
+    # context: términos/instrucciones del cliente (client_terms.prompt_section).
+    system = SYSTEM + (NO_COMMENTS if skip_comments and not context else "") + context
+    # Misma entrada + mismas instrucciones + mismo modelo = misma respuesta: se reutiliza del disco,
+    # pero solo si estaba COMPLETA (una respuesta cortada no se guarda ni se reutiliza).
+    key = hashlib.sha256("\n".join([MODEL, system, text]).encode()).hexdigest()
+    cache_file = CACHE_DIR / f"{key}.json"
+    expected = tier_headers.expected_rows(text)
+    if expected and expected > MAX_EXPECTED_ROWS:
+        raise ValueError(
+            f"The file has about {expected} rows, more than can be read at once (max {MAX_EXPECTED_ROWS}). "
+            "Pick fewer sheets (Sheets n/N) or split the file."
+        )
+    if cache_file.exists():
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        if expected is None or len(cached.get("rows", [])) >= expected:
+            return cached
+
+    best: dict | None = None
+    nudge = ""
+    for _ in range(MAX_ATTEMPTS):
+        data = _call_llm(system, text, nudge)
+        if best is None or len(data["rows"]) > len(best["rows"]):
+            best = data
+        if expected is None or len(data["rows"]) >= expected:
+            CACHE_DIR.mkdir(exist_ok=True)
+            cache_file.write_text(json.dumps(data), encoding="utf-8")
+            return data
+        # El modelo suele detenerse tras las filas con ruta explícita: se le dice cuántas hay.
+        nudge = (
+            f"\n\n[NOTA: el texto tiene {expected} líneas de datos. Devuelve UNA fila por cada línea "
+            "(y una por cada aeropuerto de origen cuando el origen sea una ciudad con varios). "
+            f"Tu respuesta anterior traía solo {len(data['rows'])} filas: faltaban.]"
+        )
+    assert best is not None
+    best["row_check"] = {"expected": expected, "got": len(best["rows"]), "complete": False}
+    return best
 
 
 def pick_rate(breaks: list[dict], required: int):
@@ -129,16 +166,25 @@ def pick_rate(breaks: list[dict], required: int):
     return chosen["rate"]
 
 
-def to_columns(row: dict) -> dict:
-    """Mapea tramos de peso a las columnas de `tariffs` (n, 45, 100, 300, 500, 1000)."""
+def to_columns(row: dict, fill_n: bool = False) -> dict:
+    """Mapea tramos de peso a las columnas de `tariffs` (n, 45, 100, 300, 500, 1000).
+
+    `n` es la tarifa del tramo base (desde 0 kg: columna N / Normal / "-100"…). Si el documento no tiene
+    tramo base, `n` queda vacío: no se inventa. Solo con `fill_n` (perfil de cliente que lo pide, como
+    EgyptAir) se rellena con la tarifa del tramo más bajo.
+    """
     br = [b for b in row.get("breaks", []) if b.get("rate") is not None and b.get("from_kg") is not None]
-    lowest = min(br, key=lambda b: b["from_kg"])["rate"] if br else None
+    base = [b for b in br if b["from_kg"] == 0]
+    if base:
+        n_rate = base[0]["rate"]
+    else:
+        n_rate = min(br, key=lambda b: b["from_kg"])["rate"] if (br and fill_n) else None
     return {
         "origin": (row.get("origin") or "").upper(),
         "destination": (row.get("destination") or "").upper(),
         "min": row.get("min"),
         "fuel": row.get("fuel_per_kg"),
-        "n": lowest,
+        "n": n_rate,
         "w45": pick_rate(br, 45),
         "w100": pick_rate(br, 100),
         "w300": pick_rate(br, 300),
@@ -179,9 +225,16 @@ def parse_file(path: Path, client_id: int | None = None, instructions: str | Non
     use_fixed = prof and prof["name"] == "EgyptAir" and not (read_instructions or "").strip()
     # El parser fijo lee las líneas del PDF; con un Excel no cuadra y cae al LLM.
     data = egypt_parser.parse_egypt(text) if use_fixed else None
+    use_fixed_used = data is not None
     if data is None:
         data = extract_with_llm(text, skip_comments=bool(prof and prof.get("comments")), context=context)
-    data["rows"] = [to_columns(r) for r in data.get("rows", [])]
+    # Tramos según el encabezado de la tabla: el modelo a veces inventa un tramo base o corre las columnas.
+    tiers = tier_headers.detect(text)
+    if tiers and not use_fixed_used:
+        fixed, skipped = tier_headers.align(data.get("rows", []), tiers)
+        data["tier_header"] = {"from_kg": tiers, "realigned_rows": fixed, "unmatched_rows": skipped}
+    fill_n = bool(prof and prof.get("n_from_lowest"))
+    data["rows"] = [to_columns(r, fill_n) for r in data.get("rows", [])]
     # Una columna de fuel toda en 0/None no es una columna real (EgyptAir): no se muestra ni crea fees.
     if not any(r["fuel"] for r in data["rows"]):
         for r in data["rows"]:
