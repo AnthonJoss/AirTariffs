@@ -11,6 +11,7 @@ from pathlib import Path
 
 import openpyxl
 
+import excel_table
 import tier_headers
 
 EXCEL_SUFFIXES = (".xlsx", ".xlsm")
@@ -58,7 +59,7 @@ def _lines(ws) -> tuple[list[str], int]:
     return [l for l in lines if l], hidden
 
 
-def sheets_info(source) -> list[dict]:
+def sheets_info(source, with_matrix: bool = True) -> list[dict]:
     """Hojas del libro para que el usuario elija: filas con datos, ocultas por filtro y selección por defecto."""
     wb = _open(source)
     out = []
@@ -68,7 +69,14 @@ def sheets_info(source) -> list[dict]:
         # ¿Es una tabla de tarifas? (encabezado `Min +45 +100 …` y líneas de datos). Un libro con una hoja
         # por producto/commodity mezcla hojas de tarifas con hojas de condiciones comerciales.
         data_rows = tier_headers.expected_rows("\n".join(lines)) or 0
+        # Tabla reconocida (encabezado + columnas de origen y destino): se lee sin IA y se puede filtrar
+        # por los valores de sus columnas (producto, servicio, región…).
+        t = excel_table.find_table(ws)
+        table = excel_table.describe(t, with_matrix) if t else None
+        if table:
+            data_rows = table["lines"]
         out.append({
+            "table": table,
             "name": ws.title,
             "visible": visible,
             "rows": len(lines),
@@ -80,6 +88,45 @@ def sheets_info(source) -> list[dict]:
         })
     wb.close()
     return out
+
+
+def table_read(source, sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None) -> dict | None:
+    """Lectura directa de las hojas que son una tabla de tarifas (sin LLM, sin tope de filas).
+
+    Devuelve {rows, meta_text, used, other, lines, tariffs}: `other` son las hojas elegidas que NO se
+    reconocieron como tabla (siguen el camino del LLM). None si ninguna hoja es una tabla.
+    `row_filter` {columna: [valores]} deja solo las filas cuya columna tenga uno de esos valores.
+    """
+    explicit = sheets is not None
+    wb = _open(source)
+    try:
+        by_name = {ws.title: ws for ws in wb.worksheets}
+        missing = [s for s in (sheets or []) if s not in by_name]
+        if missing:
+            raise ValueError(f"Sheet(s) not found in the file: {', '.join(missing)}.")
+        wanted = [by_name[s] for s in sheets] if explicit else [w for w in wb.worksheets if w.sheet_state == "visible"]
+        rows, metas, used, other, lines = [], [], [], [], 0
+        for ws in wanted:
+            t = excel_table.find_table(ws)
+            if not t:
+                # Hoja que no es tabla: va al LLM si la pidieron expresamente o si parece de tarifas; las
+                # demás (condiciones comerciales, notas) se ignoran cuando ya hay una tabla.
+                text_lines, _ = _lines(ws)
+                if text_lines and (explicit or tier_headers.expected_rows("\n".join(text_lines))):
+                    other.append(ws.title)
+                continue
+            got = excel_table.extract(t, row_filter)
+            rows += got
+            lines += len(excel_table._wanted_rows(t, row_filter))
+            metas.append(excel_table.meta_text(t))
+            used.append(ws.title)
+    finally:
+        wb.close()
+    if not used:
+        return None
+    if row_filter and not rows:
+        raise ValueError("No row matches the selected filters.")
+    return {"rows": rows, "meta_text": "\n\n".join(metas), "used": used, "other": other, "lines": lines}
 
 
 def excel_text(source, sheets: list[str] | None = None, max_chars: int = EXCEL_MAX_CHARS) -> tuple[str, list[str]]:

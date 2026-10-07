@@ -45,6 +45,12 @@ Reglas:
 - Reporta las tarifas exactamente como están impresas. No inventes datos: usa null si falta. Fechas como 01OCT26 -> 2026-10-01. Si solo se indica un mes ("Promo October 2026"), valid_from es el día 1 y valid_to el último día de ese mes."""
 
 
+META_SYSTEM = """Lees el encabezado de una hoja de tarifas aéreas de carga (lo de arriba de la tabla, los nombres de columna y unas filas de ejemplo) y devuelves SOLO los datos generales, como un JSON válido y COMPACTO:
+{"airline":"nombre o null","agent":"nombre o null","valid_from":"YYYY-MM-DD o null","valid_to":"YYYY-MM-DD o null","comments":"condiciones relevantes en texto plano, breve, o null"}
+- La vigencia puede venir en el nombre del archivo ("July to Oct 2026" -> valid_from 2026-07-01, valid_to 2026-10-31) o en el texto. Si solo se indica un mes, valid_from es el día 1 y valid_to el último día.
+- No inventes datos: usa null si falta. NO devuelvas filas de tarifas."""
+
+
 NO_COMMENTS = '\nIMPORTANTE: devuelve "comments": null (no los necesito).'
 
 
@@ -115,6 +121,30 @@ def _call_llm(system: str, text: str, nudge: str = "") -> dict:
     )
     data = json.loads(resp.choices[0].message.content)
     data["rows"] = expand_rows(data.get("rows", []))
+    return data
+
+
+def meta_with_llm(text: str, file_name: str = "", context: str = "") -> dict:
+    """Aerolínea, agente, vigencia y comentarios de una tabla ya leída (las filas NO pasan por el modelo)."""
+    _load_env()
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("Falta OPENAI_API_KEY (variable de entorno o archivo .env).")
+    prompt = f"File name: {file_name}\n\n{text[:8000]}"
+    system = META_SYSTEM + context
+    key = hashlib.sha256("\n".join([MODEL, "meta", system, prompt]).encode()).hexdigest()
+    cache_file = CACHE_DIR / f"{key}.json"
+    if cache_file.exists():
+        return json.loads(cache_file.read_text(encoding="utf-8"))
+    resp = OpenAI().chat.completions.create(
+        model=MODEL,
+        temperature=0,
+        seed=7,
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+    )
+    data = json.loads(resp.choices[0].message.content)
+    CACHE_DIR.mkdir(exist_ok=True)
+    cache_file.write_text(json.dumps(data), encoding="utf-8")
     return data
 
 
@@ -199,12 +229,25 @@ def comments_html(text) -> str:
 
 
 def parse_file(path: Path, client_id: int | None = None, instructions: str | None = None,
-               sheets: list[str] | None = None) -> dict:
+               sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None) -> dict:
     """Borrador de tarifas desde un PDF o un Excel (.xlsx/.xlsm); mismo flujo para ambos.
 
     sheets: solo Excel; hojas a considerar (None = las visibles con datos).
+    row_filter: solo Excel con tabla reconocida; {columna: [valores]} para cargar solo esas filas.
+
+    Un Excel con una tabla reconocida (encabezado de tramos + columnas de origen y destino) se lee SIN el
+    modelo, fila por fila y sin tope (excel_table); el modelo solo lee los metadatos (aerolínea, vigencia).
     """
-    text, used = source_text(path, sheets)
+    table = excel_reader.table_read(path, sheets, row_filter) if excel_reader.is_excel(path.name) else None
+    if row_filter and not table:
+        raise ValueError("The row filters need a sheet with a recognized rate table.")
+    if table:
+        used = table["used"]
+        text = table["meta_text"]
+        other_text = excel_reader.excel_text(path, table["other"])[0] if table["other"] else ""
+    else:
+        text, used = source_text(path, sheets)
+        other_text = ""
     prof = client_profiles.detect(path.name, text)
     # Términos guardados del cliente elegido en el office o, si no eligió, del detectado
     # (provider y aerolínea del perfil) + instrucciones de esta subida.
@@ -224,13 +267,25 @@ def parse_file(path: Path, client_id: int | None = None, instructions: str | Non
     # office/backend sin IA). Solo instrucciones extra de esta subida pasan por el LLM.
     use_fixed = prof and prof["name"] == "EgyptAir" and not (read_instructions or "").strip()
     # El parser fijo lee las líneas del PDF; con un Excel no cuadra y cae al LLM.
-    data = egypt_parser.parse_egypt(text) if use_fixed else None
+    data = egypt_parser.parse_egypt(text) if use_fixed and not table else None
     use_fixed_used = data is not None
-    if data is None:
+    if table:
+        # Filas leídas directamente de la tabla; el modelo solo aporta aerolínea / vigencia / comentarios.
+        data = meta_with_llm(text, path.name, context)
+        data["rows"] = table["rows"]
+        data["reader"] = {"mode": "table", "lines": table["lines"], "tariffs": len(table["rows"]),
+                          "filtered": bool(row_filter)}
+        if other_text:
+            extra = extract_with_llm(other_text, skip_comments=True, context=context)
+            tiers = tier_headers.detect(other_text)
+            if tiers:
+                tier_headers.align(extra.get("rows", []), tiers)
+            data["rows"] += extra.get("rows", [])
+    elif data is None:
         data = extract_with_llm(text, skip_comments=bool(prof and prof.get("comments")), context=context)
     # Tramos según el encabezado de la tabla: el modelo a veces inventa un tramo base o corre las columnas.
     tiers = tier_headers.detect(text)
-    if tiers and not use_fixed_used:
+    if tiers and not use_fixed_used and not table:
         fixed, skipped = tier_headers.align(data.get("rows", []), tiers)
         data["tier_header"] = {"from_kg": tiers, "realigned_rows": fixed, "unmatched_rows": skipped}
     fill_n = bool(prof and prof.get("n_from_lowest"))
@@ -242,7 +297,7 @@ def parse_file(path: Path, client_id: int | None = None, instructions: str | Non
     data["comments"] = comments_html(data.get("comments"))
     data["profile"] = prof
     if used is not None:
-        data["excel"] = {"sheets": excel_reader.sheets_info(path), "used": used}
+        data["excel"] = {"sheets": excel_reader.sheets_info(path, with_matrix=False), "used": used}
     data["ai_context"] = client_terms.summary(terms, instructions)
     data["versions"] = versions
     if versions_error:

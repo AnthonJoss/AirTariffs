@@ -88,8 +88,8 @@ async def mails_ui():
 # ---------------- Tarifas: upload -> revisión -> insert ----------------
 
 def _draft(path: Path, client_id: int | None = None, instructions: str | None = None,
-           sheets: list[str] | None = None) -> dict:
-    data = tariff_parser.parse_file(path, client_id, instructions, sheets)
+           sheets: list[str] | None = None, row_filter: dict[str, list[str]] | None = None) -> dict:
+    data = tariff_parser.parse_file(path, client_id, instructions, sheets, row_filter)
     ids = tariff_db.transport_ids([r["origin"] for r in data["rows"]] + [r["destination"] for r in data["rows"]])
     for r in data["rows"]:
         r["unknown"] = [c for c in (r["origin"], r["destination"]) if c not in ids]
@@ -107,12 +107,14 @@ async def parse_tariff_pdf(
     client_id: int | None = Form(None),
     instructions: str | None = Form(None),
     sheets: str | None = Form(None),
+    row_filter: str | None = Form(None),
 ):
     """Sube un PDF o Excel (.xlsx/.xlsm) y devuelve el borrador extraído (NO inserta nada).
 
     client_id: empresa cuyos términos guardados se aplican (si no, los del perfil detectado).
     instructions: instrucciones extra solo para este análisis.
     sheets: JSON con los nombres de las hojas a leer (solo Excel; vacío = las visibles con datos).
+    row_filter: JSON {columna: [valores]} (solo Excel con tabla): carga únicamente las filas que cumplan.
     """
     if not (file.filename or "").lower().endswith(tariff_parser.SUPPORTED_SUFFIXES):
         raise HTTPException(400, "Solo PDF o Excel (.xlsx, .xlsm)")
@@ -125,7 +127,11 @@ async def parse_tariff_pdf(
     dest.write_bytes(await file.read())
     try:
         sheet_names = json.loads(sheets) if sheets else None
-        return await run_in_threadpool(_draft, dest, client_id, instructions, sheet_names)
+        filters = json.loads(row_filter) if row_filter else None
+        if filters is not None and not (isinstance(filters, dict) and all(
+                isinstance(v, list) for v in filters.values())):
+            raise ValueError("row_filter must be a JSON object {column: [values]}.")
+        return await run_in_threadpool(_draft, dest, client_id, instructions, sheet_names, filters)
     except Exception as e:
         raise HTTPException(422, f"{type(e).__name__}: {e}")
     finally:

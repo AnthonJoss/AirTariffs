@@ -361,8 +361,68 @@ class EditNotAllowed(ValueError):
     """La edicion pedida no se puede aplicar (upload revertido, varios commodities, valores invalidos)."""
 
 
+RATE_COLUMNS = ("n", "forty_five_more", "hundred_more", "three_hundred_more", "five_hundred_more", "thousand_more")
+ADJUST_TARGETS = ("rates", "min", *RATE_COLUMNS)
+
+
+def adjust_columns(target: str) -> tuple[str, ...]:
+    return RATE_COLUMNS if target == "rates" else (target,)
+
+
+def adjust_apply(old, column: str, op: str, value: float):
+    """Valor nuevo de una celda: null se queda null, nunca baja de 0; 2 decimales (el minimo, entero)."""
+    if old is None:
+        return None
+    new = old * (1 + value / 100) if op == "pct" else old + value
+    new = max(0.0, new)
+    return int(round(new)) if column == "min" else round(new, 2)
+
+
+def adjust_sets(adjust: list[dict]) -> tuple[list[str], list]:
+    """`columna = expresion` y sus parametros: el mismo calculo que AirTariffAdjust.php del backend."""
+    expr: dict[str, str] = {}
+    params: dict[str, list] = {}
+    for a in adjust:
+        for col in adjust_columns(a["target"]):
+            cur = expr.get(col, f"`{col}`")
+            calc = f"({cur}) * (1 + %s / 100)" if a["op"] == "pct" else f"({cur}) + %s"
+            expr[col] = f"ROUND(GREATEST(0, {calc}), {0 if col == 'min' else 2})"
+            params[col] = [*params.get(col, []), a["value"]]
+    return [f"`{c}` = {e}" for c, e in expr.items()], [v for c in expr for v in params[c]]
+
+
+def adjust_text(a: dict) -> str:
+    v = a["value"]
+    num = f"{abs(v):g}"
+    amount = f"{'+' if v >= 0 else '−'}{num} %" if a["op"] == "pct" else f"{'+' if v >= 0 else '−'}{num} USD"
+    what = {"rates": "all per-kg rates", "min": "the minimum charge"}.get(a["target"], f"the {a['target']} break")
+    return f"{amount} on {what}"
+
+
+def _clean_adjust(raw) -> list[dict]:
+    if not raw:
+        return []
+    if not isinstance(raw, list) or len(raw) > 10:
+        raise EditNotAllowed("adjust must be a list of up to 10 adjustments.")
+    out = []
+    for a in raw:
+        try:
+            target, op, value = a["target"], a["op"], float(a["value"])
+        except (KeyError, TypeError, ValueError):
+            raise EditNotAllowed("Each adjustment needs a target, an operation and a number.") from None
+        if target not in ADJUST_TARGETS or op not in ("pct", "add"):
+            raise EditNotAllowed("Invalid adjustment.")
+        if op == "pct" and value <= -100:
+            raise EditNotAllowed("A percentage cut must be smaller than 100 %.")
+        out.append({"target": target, "op": op, "value": value})
+    return out
+
+
 def _clean_changes(changes: dict) -> dict:
     out: dict = {}
+    adjust = _clean_adjust(changes.get("adjust"))
+    if adjust:
+        out["adjust"] = adjust
     for k in EDITABLE:
         v = changes.get(k)
         if v in (None, ""):
@@ -380,6 +440,30 @@ def _clean_changes(changes: dict) -> dict:
         raise EditNotAllowed("airchaft must be 1 (CAO), 2 (PAX) or 3 (CAO/PAX).")
     if not out:
         raise EditNotAllowed("Nothing to change.")
+    return out
+
+
+def _adjust_samples(cur, ids: list[int], adjust: list[dict]) -> list[dict]:
+    """Hasta 3 tarifas de la seleccion con sus valores antes -> despues, para revisar el ajuste."""
+    cols = sorted({c for a in adjust for c in adjust_columns(a["target"])})
+    pick = sorted(ids)[:3]
+    if not pick:
+        return []
+    cur.execute(
+        f"SELECT t.id, o.codigo, d.codigo, a.fullname, {', '.join('t.`' + c + '`' for c in cols)} FROM tariffs t "
+        "LEFT JOIN transports o ON o.id = t.origin_id LEFT JOIN transports d ON d.id = t.destin_id "
+        f"LEFT JOIN companies a ON a.id = t.airline_id WHERE t.id IN ({_marks(len(pick))}) ORDER BY t.id",
+        pick,
+    )
+    out = []
+    for row in cur.fetchall():
+        before = {c: (float(v) if v is not None else None) for c, v in zip(cols, row[4:])}
+        after = dict(before)
+        for a in adjust:
+            for c in adjust_columns(a["target"]):
+                after[c] = adjust_apply(after[c], c, a["op"], a["value"])
+        label = f"{row[3] or ''} · {(row[1] or '').strip()} → {(row[2] or '').strip()}".strip(" ·")
+        out.append({"id": row[0], "label": label, "before": before, "after": after})
     return out
 
 
@@ -475,7 +559,9 @@ def edit_batches(batch_ids: list[str], changes: dict, edited_by: str | None = No
 
         summary: dict = {}
         for field in changes:
-            if field in table:
+            if field == "adjust":
+                summary[field] = {"from": None, "to": "; ".join(adjust_text(a) for a in changes[field])}
+            elif field in table:
                 nm = names(field, {p[col[field]] for p in active_parts} | {changes[field]})
                 olds = sorted({nm.get(p[col[field]], str(p[col[field]])) for p in active_parts if p[col[field]] is not None})
                 summary[field] = {"from": olds, "to": nm.get(changes[field], str(changes[field]))}
@@ -492,6 +578,8 @@ def edit_batches(batch_ids: list[str], changes: dict, edited_by: str | None = No
             "duplicates": dup,
             "changes": summary,
         }
+        if "adjust" in changes:
+            result["samples"] = _adjust_samples(cur, existing[:200], changes["adjust"])
         if dry_run:
             return result
 
@@ -501,6 +589,10 @@ def edit_batches(batch_ids: list[str], changes: dict, edited_by: str | None = No
             if field in changes:
                 sets.append(f"{tcol} = %s")
                 params.append(changes[field])
+        if "adjust" in changes:
+            adj_sets, adj_params = adjust_sets(changes["adjust"])
+            sets += adj_sets
+            params += adj_params
         try:
             for chunk in _chunks(existing):
                 cur.execute(

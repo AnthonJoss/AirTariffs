@@ -159,3 +159,26 @@ POST http://127.0.0.1:8001/tariffs/uploads/revert
 Content-Type: application/json
 
 {"batch_id": "REEMPLAZAR-POR-EL-batch_id", "reverted_by": "Franco"}
+
+
+### Analiza solo parte de la tabla de un Excel (row_filter = JSON {columna: [valores]})
+POST http://127.0.0.1:8001/tariffs/parse
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="rates.xlsx"
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+
+< ./excels/rates.xlsx
+--WebAppBoundary
+Content-Disposition: form-data; name="row_filter"
+
+{"Product Name": ["AC General - Standard"], "Region Destination": ["Asia"]}
+--WebAppBoundary--
+
+### Ajusta +40 % las tarifas por kg y +10 USD el minimo de un upload (dry_run: solo cuenta y da ejemplos)
+POST http://127.0.0.1:8001/tariffs/uploads/edit
+Content-Type: application/json
+
+{"batch_ids": ["<batch_id>"], "dry_run": true,
+ "changes": {"adjust": [{"target": "rates", "op": "pct", "value": 40}, {"target": "min", "op": "add", "value": 10}]}}
