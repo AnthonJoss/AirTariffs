@@ -356,6 +356,19 @@ def list_tabs(url: str) -> list[dict]:
     return tabs
 
 
+def _card_rows(parsed: dict, ids: dict) -> list[dict]:
+    """Filas de un tarifario completo tal como se cargarían (para el preview): origen, destino, producto y tramos."""
+    return [
+        {
+            "origin": r["origin"], "destination": r["dest"], "via": None, "aircraft": r["ac"], "rate": r["w300"] or 0,
+            "min": round(r["min"]), "known": r["dest"] in ids and r["origin"] in ids, "product": r["product"],
+            "routing": r["routing"], "n": r["n"], "w45": r["w45"], "w100": r["w100"], "w300": r["w300"],
+            "w500": r["w500"], "w1000": r["w1000"],
+        }
+        for r in parsed["rows"]
+    ]
+
+
 def preview_tabs(url: str) -> list[dict]:
     """Resumen de CADA pestaña (formato, tarifas, orígenes, commodity que declara). No guarda nada. Una pestaña que
     no se reconoce (otro formato, vacía) vuelve con `error` y no se puede registrar."""
@@ -371,10 +384,11 @@ def preview_tabs(url: str) -> list[dict]:
                 "format": parsed["format"], "tariffs": len(parsed["rows"]), "origins": origins,
                 "commodity_hint": parsed["commodity_hint"], "commodity_codes": parsed.get("commodity_codes", []),
                 "unknown": sorted({c for c in [*origins, *{r["dest"] for r in parsed["rows"]}] if c not in ids}),
+                "rows": _card_rows(parsed, ids) if parsed["format"] == "ratecard" else [],
             })
         except LinkError as e:
             item.update({"format": None, "tariffs": 0, "origins": [], "commodity_hint": None, "commodity_codes": [],
-                         "unknown": [], "error": str(e)})
+                         "unknown": [], "rows": [], "error": str(e)})
         out.append(item)
     return out
 
@@ -392,15 +406,7 @@ def preview(url: str) -> dict:
     for r in parsed["rows"]:
         by_ac[r["ac"]] = by_ac.get(r["ac"], 0) + 1
     if ratecard:
-        rows = [
-            {
-                "origin": r["origin"], "destination": r["dest"], "via": None, "aircraft": r["ac"], "rate": r["w300"] or 0,
-                "min": round(r["min"]), "known": r["dest"] in ids and r["origin"] in ids, "product": r["product"],
-                "routing": r["routing"], "n": r["n"], "w45": r["w45"], "w100": r["w100"], "w300": r["w300"],
-                "w500": r["w500"], "w1000": r["w1000"],
-            }
-            for r in parsed["rows"]
-        ]
+        rows = _card_rows(parsed, ids)
     else:
         # Lo que se cargaría por fila (mismo cálculo que `sync`): tarifa/kg en +300/+500/+1000 y mínimo.
         rows = [
