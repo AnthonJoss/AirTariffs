@@ -8,6 +8,11 @@ Formato esperado de la hoja (WEEKLY SPOTS): filas `UPDATE DATE | mm/dd/yyyy`, `W
 `DEST | ENTRY CONDITION ALL IN/KG RANGE | A/C`. Destino = código IATA (también "GRU VIA MCO"), tarifa en
 USD/kg con coma decimal o `CLOSED`, A/C = CAO (airchaft 1) o PAX (airchaft 2). Los spots aplican a +300 kg:
 la tarifa va a los tramos +300/+500/+1000 y el mínimo es tarifa × 300.
+
+También lee tarifarios completos (RATE CARD): una pestaña por commodity con columnas
+`Origin | Destination | Product Code | Product Name | Commodity Code | Routing | Min Charge | 0 | 45 | 100 | 300 | 500 | 1,000 | 2,000`.
+Cada pestaña es un link (con su `#gid=`) y un commodity; el `Routing` solo se anota, no se usa como vía. Los importes
+vienen con `$` y coma decimal (`$19,30`) y se normalizan; el tramo `2,000` no existe en el sistema y se omite.
 """
 import csv
 import hashlib
@@ -143,8 +148,99 @@ def _rate(text: str) -> float | None:
     return float(t.replace(",", "."))
 
 
+RATECARD_TIERS = {0: "n", 45: "w45", 100: "w100", 300: "w300", 500: "w500", 1000: "w1000"}
+_THOUSANDS = re.compile(r"\d{1,3}(?:,\d{3})+")
+
+
+def _money(text: str) -> float | None:
+    """'$19,30' -> 19.3; '$1,050' -> 1050; '1.050,50' -> 1050.5; 'CLOSED'/vacío -> None."""
+    t = re.sub(r"(?i)usd|\$|\s", "", text or "")
+    if not re.fullmatch(r"[\d.,]+", t) or not re.search(r"\d", t):
+        return None
+    if "," in t and "." in t:  # el último separador es el decimal
+        dec = "," if t.rfind(",") > t.rfind(".") else "."
+        thou = "." if dec == "," else ","
+        t = t.replace(thou, "").replace(dec, ".")
+    elif "," in t:
+        t = t.replace(",", "") if _THOUSANDS.fullmatch(t) else t.replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _parse_ratecard(text: str) -> dict | None:
+    """Tarifario completo (una pestaña = un commodity). None si la hoja no tiene la cabecera Origin/Destination."""
+    rows_in = list(csv.reader(io.StringIO(text)))
+    head_i = next(
+        (i for i, r in enumerate(rows_in) if {"origin", "destination"} <= {c.strip().lower() for c in r}), None
+    )
+    if head_i is None:
+        return None
+    head = [c.strip().lower() for c in rows_in[head_i]]
+    col = {name: head.index(name) for name in ("origin", "destination") }
+    for name, keys in (("product", ("product name", "product")), ("code", ("product code",)),
+                       ("commodity", ("commodity code", "commodity")), ("routing", ("routing", "route"))):
+        col[name] = next((head.index(k) for k in keys if k in head), None)
+    col["min"] = next((i for i, h in enumerate(head) if h.startswith("min")), None)
+    tiers: dict[str, int] = {}
+    for i, h in enumerate(head):
+        if re.fullmatch(r"[\d.,]+", h) and re.search(r"\d", h):
+            kg = _money(h.replace(".", ","))  # '1,000' -> 1000
+            if kg is not None and int(kg) in RATECARD_TIERS:
+                tiers[RATECARD_TIERS[int(kg)]] = i
+    if col["min"] is None or not tiers:
+        raise LinkError("The rate card needs a 'Min Charge' column and the weight break columns (0, 45, 100, 300…).")
+
+    get = lambda r, k: (r[col[k]].strip() if col.get(k) is not None and col[k] < len(r) else "")  # noqa: E731
+    notes = [" ".join(c.split()) for r in rows_in[:head_i] for c in r if len(c.strip()) > 40]
+    rows: list[dict] = []
+    closed: list[str] = []
+    seen: set = set()
+    commodities: set[str] = set()
+    for r in rows_in[head_i + 1:]:
+        o, d = get(r, "origin").upper(), get(r, "destination").upper()
+        if not (re.fullmatch(r"[A-Z]{3}", o) and re.fullmatch(r"[A-Z]{3}", d)):
+            continue
+        product = " ".join(get(r, "product").split()) or get(r, "code")
+        ac = "PAX" if "PAX" in product.upper() else "CAO"
+        vals = {k: (_money(r[i]) if i < len(r) else None) for k, i in tiers.items()}
+        minimum = _money(get(r, "min"))
+        if minimum is None or all(v is None for v in vals.values()):
+            closed.append(f"{o}-{d} {product}".strip())
+            continue
+        routing = get(r, "routing").upper()
+        row = {
+            "origin": o, "dest": d, "via": None, "ac": ac, "product": product, "routing": routing or None,
+            "min": minimum, "n": vals.get("n"), "w45": vals.get("w45"), "w100": vals.get("w100"),
+            "w300": vals.get("w300"), "w500": vals.get("w500"), "w1000": vals.get("w1000"),
+        }
+        # Misma tarifa repetida por distinto routing: se carga una sola vez (el routing no se usa para cotizar).
+        key = (o, d, ac, product, row["min"], *(row[k] for k in ("n", "w45", "w100", "w300", "w500", "w1000")))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+        if get(r, "commodity"):
+            commodities.add(get(r, "commodity").upper())
+    if not rows:
+        raise LinkError("No rates were found in the rate card.")
+    origins = sorted({r["origin"] for r in rows})
+    joined = " ".join(commodities)
+    hint = "dangerous" if re.search(r"DANGER|HAZ|DGR", joined) else ("general cargo" if "GENERAL" in joined else None)
+    return {
+        "format": "ratecard", "update_date": datetime.now().date(), "week": None, "notes": notes, "rows": rows,
+        "closed": closed, "origin": origins[0] if len(origins) == 1 else None, "origins": origins,
+        "commodity_hint": hint, "specials": [], "commodity_codes": sorted(commodities),
+    }
+
+
 def parse_sheet(text: str) -> dict:
-    """{update_date, week, notes, rows:[{dest, via, rate, ac}], closed:[…]} desde el CSV de la hoja."""
+    """{update_date, week, notes, rows:[{dest, via, rate, ac}], closed:[…]} desde el CSV de la hoja.
+    Si la hoja es un tarifario completo (Origin/Destination/Min Charge/tramos) devuelve `format: "ratecard"`."""
+    card = _parse_ratecard(text)
+    if card:
+        return card
     update_date = week = origin = None
     notes: list[str] = []
     rows: list[dict] = []
@@ -194,7 +290,7 @@ def parse_sheet(text: str) -> dict:
     commodity_hint = "general cargo" if "GENERAL CARGO" in text_notes else None
     specials = detect_specials(" ".join(notes))
     return {
-        "update_date": update_date, "week": week, "notes": notes, "rows": rows, "closed": closed,
+        "format": "spot", "update_date": update_date, "week": week, "notes": notes, "rows": rows, "closed": closed,
         "origin": origin, "commodity_hint": commodity_hint, "specials": specials,
     }
 
@@ -222,6 +318,9 @@ def detect_specials(text: str) -> list[dict]:
 
 
 def _comments(link: dict, parsed: dict) -> str:
+    if parsed.get("format") == "ratecard":
+        text = f"Rate card (loaded {parsed['update_date']}). " + " ".join(parsed["notes"])
+        return "<p>" + text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:900] + "</p>"
     wk = f" WK {parsed['week']}" if parsed["week"] else ""
     text = f"Spot rate{wk} (updated {parsed['update_date']}). " + " ".join(parsed["notes"])
     return "<p>" + text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:900] + "</p>"
@@ -231,29 +330,46 @@ def preview(url: str) -> dict:
     """Qué contiene la hoja (no guarda nada): fecha, semana, destinos, tipos de avión y lo que se pudo deducir
     (origen, commodity) para precargar el formulario. El origen solo se propone si existe en `transports`."""
     parsed = parse_sheet(fetch_csv(url))
+    ratecard = parsed["format"] == "ratecard"
     dests = sorted({r["dest"] for r in parsed["rows"]})
+    origins = parsed.get("origins") or ([parsed["origin"]] if parsed["origin"] else [])
     origin = parsed["origin"]
-    ids = tariff_db.transport_ids([*dests, *([origin] if origin else [])])
+    ids = tariff_db.transport_ids([*dests, *origins])
     by_ac: dict[str, int] = {}
     for r in parsed["rows"]:
         by_ac[r["ac"]] = by_ac.get(r["ac"], 0) + 1
-    return {
-        "update_date": parsed["update_date"].isoformat(),
-        "week": parsed["week"],
-        "tariffs": len(parsed["rows"]),
-        "by_aircraft": by_ac,
-        "destinations": dests,
-        "unknown_destinations": [d for d in dests if d not in ids],
-        "closed": parsed["closed"],
-        "notes": parsed["notes"],
+    if ratecard:
+        rows = [
+            {
+                "origin": r["origin"], "destination": r["dest"], "via": None, "aircraft": r["ac"], "rate": r["w300"] or 0,
+                "min": round(r["min"]), "known": r["dest"] in ids and r["origin"] in ids, "product": r["product"],
+                "routing": r["routing"], "n": r["n"], "w45": r["w45"], "w100": r["w100"], "w300": r["w300"],
+                "w500": r["w500"], "w1000": r["w1000"],
+            }
+            for r in parsed["rows"]
+        ]
+    else:
         # Lo que se cargaría por fila (mismo cálculo que `sync`): tarifa/kg en +300/+500/+1000 y mínimo.
-        "rows": [
+        rows = [
             {
                 "destination": r["dest"], "via": r["via"], "aircraft": r["ac"], "rate": r["rate"],
                 "min": round(r["rate"] * MIN_KG), "known": r["dest"] in ids,
             }
             for r in parsed["rows"]
-        ],
+        ]
+    return {
+        "format": parsed["format"],
+        "update_date": parsed["update_date"].isoformat(),
+        "week": parsed["week"],
+        "tariffs": len(parsed["rows"]),
+        "by_aircraft": by_ac,
+        "destinations": dests,
+        "origins": origins,
+        "unknown_destinations": [d for d in dests if d not in ids],
+        "unknown_origins": [o for o in origins if o not in ids],
+        "closed": parsed["closed"],
+        "notes": parsed["notes"],
+        "rows": rows,
         "origin": origin if origin in ids else None,
         "commodity_hint": parsed["commodity_hint"],
         "specials": parsed["specials"],
@@ -437,11 +553,16 @@ def register(body: dict, created_by: str | None) -> dict:
     ensure_table()
     url = (body.get("url") or "").strip()
     csv_url(url)  # valida el formato antes de guardar
-    origin = (body.get("origin") or "").strip().upper()
-    if not re.fullmatch(r"[A-Z]{3}", origin):
-        raise LinkError("The origin must be a 3-letter airport code (e.g. MIA).")
-    if origin not in tariff_db.transport_ids([origin]):
-        raise LinkError(f"Origin airport {origin} was not found.")
+    text = fetch_csv(url)
+    parsed = parse_sheet(text)  # si la hoja no se reconoce no se registra nada
+    if parsed["format"] == "ratecard":
+        origin = parsed["origin"] or "MULTI"  # el origen sale de cada fila del tarifario
+    else:
+        origin = (body.get("origin") or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", origin):
+            raise LinkError("The origin must be a 3-letter airport code (e.g. MIA).")
+        if origin not in tariff_db.transport_ids([origin]):
+            raise LinkError(f"Origin airport {origin} was not found.")
     try:
         provider_id, airline_id, commodity_id = (int(body[k]) for k in ("provider_id", "airline_id", "commodity_id"))
         valid_days = int(body.get("valid_days") or DEFAULT_VALID_DAYS)
@@ -451,8 +572,6 @@ def register(body: dict, created_by: str | None) -> dict:
         raise LinkError("Validity must be between 1 and 90 days.")
     versions = _clean_versions(body.get("versions"))
     name = " ".join(str(body.get("name") or "").split())[:120] or "Spot rates"
-    text = fetch_csv(url)
-    parse_sheet(text)  # si la hoja no se reconoce no se registra nada
     with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO airtariff_links (name, url, origin_code, provider_id, airline_id, commodity_id, valid_days, "
@@ -478,6 +597,40 @@ def _save_state(link_id: int, _user: str | None = None, **cols) -> None:
         conn.commit()
 
 
+def _load_ratecard(link: dict, parsed: dict, valid_to, user: str | None) -> tuple[list[str], int, list[str]]:
+    """Inserta un tarifario completo: un lote por tipo de avión, origen y destino de cada fila, todos los tramos
+    de la fila y el producto (y el routing, solo informativo) como nota de la tarifa."""
+    ids = tariff_db.transport_ids([x for r in parsed["rows"] for x in (r["origin"], r["dest"])])
+    unknown = sorted({c for r in parsed["rows"] for c in (r["origin"], r["dest"]) if c not in ids})
+    rows_ok = [r for r in parsed["rows"] if r["origin"] in ids and r["dest"] in ids]
+    if not rows_ok:
+        raise LinkError("None of the airports exist in transports.")
+    comments = _comments(link, parsed)
+    batches: list[str] = []
+    total = 0
+    for ac, aircraft in AIRCRAFT.items():
+        rows = [
+            {
+                "origin": r["origin"], "destination": r["dest"], "min": round(r["min"]), "n": r["n"], "w45": r["w45"],
+                "w100": r["w100"], "w300": r["w300"], "w500": r["w500"], "w1000": r["w1000"],
+                "note": " · ".join(x for x in (r["product"], f"routing {r['routing']}" if r["routing"] else None) if x) or None,
+            }
+            for r in rows_ok if r["ac"] == ac
+        ]
+        if not rows:
+            continue
+        header = {
+            "provider_id": link["provider_id"], "airline_id": link["airline_id"], "commodity_id": link["commodity_id"],
+            "valid_to": valid_to.isoformat(), "airchaft": aircraft, "comments": comments,
+            "source_file": f"{link['name']} (link) {ac}", "uploaded_by": user or "link-sync",
+        }
+        res = tariff_db.insert_tariffs(header, rows)
+        total += res["tariffs"]
+        if res.get("batch_id"):
+            batches.append(res["batch_id"])
+    return batches, total, unknown
+
+
 def sync(link_id: int, force: bool = False, user: str | None = None, text: str | None = None) -> dict:
     """Revisa la hoja; si cambió (o `force`) reemplaza las tarifas del link. Devuelve el estado del link + `result`."""
     ensure_table()
@@ -493,57 +646,28 @@ def sync(link_id: int, force: bool = False, user: str | None = None, text: str |
             return {**_one(link_id), "result": "unchanged"}
         parsed = parse_sheet(text)
         valid_to = parsed["update_date"] + timedelta(days=link["valid_days"])
-        ids = tariff_db.transport_ids([link["origin"], *(r["dest"] for r in parsed["rows"])])
-        if link["origin"] not in ids:
-            raise LinkError(f"Origin airport {link['origin']} was not found.")
-        unknown = sorted({r["dest"] for r in parsed["rows"] if r["dest"] not in ids})
-        parsed["rows"] = [r for r in parsed["rows"] if r["dest"] in ids]
-        if not parsed["rows"]:
-            raise LinkError("None of the destinations exist in transports.")
-
-        # Primero se inserta lo nuevo (un lote por tipo de avión) y después se revierte lo anterior.
-        batches: list[str] = []
-        total = 0
-        comments = _comments(link, parsed)
-        for ac, aircraft in AIRCRAFT.items():
-            rows = [
-                {
-                    "origin": link["origin"], "destination": r["dest"], "min": round(r["rate"] * MIN_KG), "n": None,
-                    "w45": None, "w100": None, "w300": r["rate"], "w500": r["rate"], "w1000": r["rate"],
-                    "note": f"via {r['via']}" if r["via"] else None,
-                }
-                for r in parsed["rows"] if r["ac"] == ac
-            ]
-            if not rows:
-                continue
-            header = {
-                "provider_id": link["provider_id"], "airline_id": link["airline_id"], "commodity_id": link["commodity_id"],
-                "valid_to": valid_to.isoformat(), "airchaft": aircraft, "comments": comments,
-                "source_file": f"{link['name']} (link) WK {parsed['week'] or '?'} {ac}", "uploaded_by": user or "link-sync",
-            }
-            res = tariff_db.insert_tariffs(header, rows)
-            total += res["tariffs"]
-            if res.get("batch_id"):
-                batches.append(res["batch_id"])
-
-        # Commodities especiales (DG…): mismas tarifas con +pct % (también en el mínimo) y su fee como regla.
-        # Si la hoja declara otro porcentaje/monto, manda la hoja.
-        sheet_dg = next((x for x in parsed["specials"] if x["kind"] == "dangerous"), None)
+        unknown: list[str] = []
         notes_v: list[str] = []
-        for v in link["versions"]:
-            pct, fee = v["pct"], v.get("fee")
-            if sheet_dg and v.get("kind") == "dangerous":
-                pct = sheet_dg["pct"] if sheet_dg["pct"] is not None else pct
-                if fee and sheet_dg["flat"]:
-                    fee = {**fee, "amount": sheet_dg["flat"]}
-            factor = 1 + pct / 100
-            v_batches: list[str] = []
+        if parsed["format"] == "ratecard":
+            batches, total, unknown = _load_ratecard(link, parsed, valid_to, user)
+        else:
+            ids = tariff_db.transport_ids([link["origin"], *(r["dest"] for r in parsed["rows"])])
+            if link["origin"] not in ids:
+                raise LinkError(f"Origin airport {link['origin']} was not found.")
+            unknown = sorted({r["dest"] for r in parsed["rows"] if r["dest"] not in ids})
+            parsed["rows"] = [r for r in parsed["rows"] if r["dest"] in ids]
+            if not parsed["rows"]:
+                raise LinkError("None of the destinations exist in transports.")
+
+            # Primero se inserta lo nuevo (un lote por tipo de avión) y después se revierte lo anterior.
+            batches: list[str] = []
+            total = 0
+            comments = _comments(link, parsed)
             for ac, aircraft in AIRCRAFT.items():
                 rows = [
                     {
-                        "origin": link["origin"], "destination": r["dest"], "min": round(r["rate"] * MIN_KG * factor),
-                        "n": None, "w45": None, "w100": None, "w300": round(r["rate"] * factor, 2),
-                        "w500": round(r["rate"] * factor, 2), "w1000": round(r["rate"] * factor, 2),
+                        "origin": link["origin"], "destination": r["dest"], "min": round(r["rate"] * MIN_KG), "n": None,
+                        "w45": None, "w100": None, "w300": r["rate"], "w500": r["rate"], "w1000": r["rate"],
                         "note": f"via {r['via']}" if r["via"] else None,
                     }
                     for r in parsed["rows"] if r["ac"] == ac
@@ -551,20 +675,53 @@ def sync(link_id: int, force: bool = False, user: str | None = None, text: str |
                 if not rows:
                     continue
                 header = {
-                    "provider_id": link["provider_id"], "airline_id": link["airline_id"],
-                    "commodity_id": v["commodity_id"], "valid_to": valid_to.isoformat(), "airchaft": aircraft,
-                    "comments": comments, "uploaded_by": user or "link-sync",
-                    "source_file": f"{link['name']} (link) WK {parsed['week'] or '?'} {ac} +{pct:g}%",
+                    "provider_id": link["provider_id"], "airline_id": link["airline_id"], "commodity_id": link["commodity_id"],
+                    "valid_to": valid_to.isoformat(), "airchaft": aircraft, "comments": comments,
+                    "source_file": f"{link['name']} (link) WK {parsed['week'] or '?'} {ac}", "uploaded_by": user or "link-sync",
                 }
                 res = tariff_db.insert_tariffs(header, rows)
                 total += res["tariffs"]
                 if res.get("batch_id"):
-                    v_batches.append(res["batch_id"])
-            batches.extend(v_batches)
-            if fee and v_batches:
-                rule_id = _create_fee_rule(link, v, fee, user)
-                upload_history.attach_rules(v_batches[0], [rule_id])
-            notes_v.append(f"+{pct:g}%" + (f" and fee {fee['amount']:g}" if fee else ""))
+                    batches.append(res["batch_id"])
+
+            # Commodities especiales (DG…): mismas tarifas con +pct % (también en el mínimo) y su fee como regla.
+            # Si la hoja declara otro porcentaje/monto, manda la hoja.
+            sheet_dg = next((x for x in parsed["specials"] if x["kind"] == "dangerous"), None)
+            for v in link["versions"]:
+                pct, fee = v["pct"], v.get("fee")
+                if sheet_dg and v.get("kind") == "dangerous":
+                    pct = sheet_dg["pct"] if sheet_dg["pct"] is not None else pct
+                    if fee and sheet_dg["flat"]:
+                        fee = {**fee, "amount": sheet_dg["flat"]}
+                factor = 1 + pct / 100
+                v_batches: list[str] = []
+                for ac, aircraft in AIRCRAFT.items():
+                    rows = [
+                        {
+                            "origin": link["origin"], "destination": r["dest"], "min": round(r["rate"] * MIN_KG * factor),
+                            "n": None, "w45": None, "w100": None, "w300": round(r["rate"] * factor, 2),
+                            "w500": round(r["rate"] * factor, 2), "w1000": round(r["rate"] * factor, 2),
+                            "note": f"via {r['via']}" if r["via"] else None,
+                        }
+                        for r in parsed["rows"] if r["ac"] == ac
+                    ]
+                    if not rows:
+                        continue
+                    header = {
+                        "provider_id": link["provider_id"], "airline_id": link["airline_id"],
+                        "commodity_id": v["commodity_id"], "valid_to": valid_to.isoformat(), "airchaft": aircraft,
+                        "comments": comments, "uploaded_by": user or "link-sync",
+                        "source_file": f"{link['name']} (link) WK {parsed['week'] or '?'} {ac} +{pct:g}%",
+                    }
+                    res = tariff_db.insert_tariffs(header, rows)
+                    total += res["tariffs"]
+                    if res.get("batch_id"):
+                        v_batches.append(res["batch_id"])
+                batches.extend(v_batches)
+                if fee and v_batches:
+                    rule_id = _create_fee_rule(link, v, fee, user)
+                    upload_history.attach_rules(v_batches[0], [rule_id])
+                notes_v.append(f"+{pct:g}%" + (f" and fee {fee['amount']:g}" if fee else ""))
 
         for b in old_batches:
             try:

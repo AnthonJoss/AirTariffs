@@ -349,7 +349,7 @@ async def restore_history(body: RestoreRequest):
 class LinkRequest(BaseModel):
     url: str
     name: str | None = None
-    origin: str
+    origin: str | None = None  # tarifario completo: el origen sale de cada fila
     provider_id: int
     airline_id: int
     commodity_id: int
