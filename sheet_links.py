@@ -114,7 +114,7 @@ def ensure_table() -> None:
 def csv_url(url: str) -> str:
     """Convierte el link de la hoja publicada (…/pubhtml) en su CSV (…/pub?output=csv), conservando el gid."""
     url = (url or "").strip()
-    m = re.match(r"^https://docs\.google\.com/spreadsheets/(?:u/\d+/)?d/e/([\w-]+)/pub(?:html)?(?:[/?].*)?$", url)
+    m = re.match(r"^https://docs\.google\.com/spreadsheets/(?:u/\d+/)?d/e/([\w-]+)/pub(?:html)?(?:[/?#].*)?$", url)
     if not m:
         raise LinkError("The link must be a published Google Sheet (File ▸ Share ▸ Publish to web).")
     gid = re.search(r"[?&#]gid=(\d+)", url)
