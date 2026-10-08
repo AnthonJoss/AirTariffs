@@ -326,6 +326,59 @@ def _comments(link: dict, parsed: dict) -> str:
     return "<p>" + text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")[:900] + "</p>"
 
 
+def pubhtml_base(url: str) -> str:
+    """El link sin pestaña (`#gid=` / `?gid=`): la hoja publicada completa (`…/pubhtml`)."""
+    m = re.match(r"^(https://docs\.google\.com/spreadsheets/(?:u/\d+/)?d/e/[\w-]+/pub(?:html)?)", (url or "").strip())
+    if not m:
+        raise LinkError("The link must be a published Google Sheet (File ▸ Share ▸ Publish to web).")
+    return m.group(1)
+
+
+def list_tabs(url: str) -> list[dict]:
+    """Pestañas de la hoja publicada: [{name, gid}] (la página `pubhtml` las trae en su menú). [] si no se pueden leer."""
+    req = urllib.request.Request(pubhtml_base(url), headers={"User-Agent": "airtariffs-sync/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            html = resp.read(3_000_000).decode("utf-8", errors="replace")
+    except Exception as e:  # red, 404 si se despublicó, etc.
+        raise LinkError(f"Could not download the sheet: {e}") from e
+    tabs, seen = [], set()
+    for m in re.finditer(r'items\.push\(\{name:\s*"((?:[^"\\]|\\.)*)",\s*pageUrl:\s*"[^"]*",\s*gid:\s*"(\d+)"', html):
+        gid = m.group(2)
+        if gid in seen:
+            continue
+        seen.add(gid)
+        try:
+            name = json.loads(f'"{m.group(1)}"')
+        except ValueError:
+            name = m.group(1)
+        tabs.append({"name": " ".join(name.split()) or f"Tab {gid}", "gid": gid})
+    return tabs
+
+
+def preview_tabs(url: str) -> list[dict]:
+    """Resumen de CADA pestaña (formato, tarifas, orígenes, commodity que declara). No guarda nada. Una pestaña que
+    no se reconoce (otro formato, vacía) vuelve con `error` y no se puede registrar."""
+    base = pubhtml_base(url)
+    out = []
+    for t in list_tabs(url):
+        item = {"name": t["name"], "gid": t["gid"], "url": f"{base}#gid={t['gid']}", "error": None}
+        try:
+            parsed = parse_sheet(fetch_csv(item["url"]))
+            origins = parsed.get("origins") or ([parsed["origin"]] if parsed["origin"] else [])
+            ids = tariff_db.transport_ids([*origins, *{r["dest"] for r in parsed["rows"]}])
+            item.update({
+                "format": parsed["format"], "tariffs": len(parsed["rows"]), "origins": origins,
+                "commodity_hint": parsed["commodity_hint"], "commodity_codes": parsed.get("commodity_codes", []),
+                "unknown": sorted({c for c in [*origins, *{r["dest"] for r in parsed["rows"]}] if c not in ids}),
+            })
+        except LinkError as e:
+            item.update({"format": None, "tariffs": 0, "origins": [], "commodity_hint": None, "commodity_codes": [],
+                         "unknown": [], "error": str(e)})
+        out.append(item)
+    return out
+
+
 def preview(url: str) -> dict:
     """Qué contiene la hoja (no guarda nada): fecha, semana, destinos, tipos de avión y lo que se pudo deducir
     (origen, commodity) para precargar el formulario. El origen solo se propone si existe en `transports`."""
@@ -373,6 +426,8 @@ def preview(url: str) -> dict:
         "origin": origin if origin in ids else None,
         "commodity_hint": parsed["commodity_hint"],
         "specials": parsed["specials"],
+        # Hoja con varias pestañas (una por commodity): resumen de cada una, para cargarlas juntas.
+        "tabs": preview_tabs(url) if ratecard else [],
     }
 
 
