@@ -240,6 +240,7 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
     replace = tariff_archive.clean_spec(header.get("replace"))  # valida antes de insertar nada
     if replace:
         tariff_archive.ensure_table()
+    skip_rule_ids = upload_history.clean_skip_rule_ids(header.get("skip_rule_ids"))
     fee_count = 0
     archived = 0
     tariff_ids: list[int] = []
@@ -262,6 +263,8 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
                     fee_count += 1
             # Historial del upload (para poder revertirlo) en la MISMA transaccion: o entra todo o nada.
             batch_id = upload_history.record_upload(cur, header, tariff_ids, fee_count)
+            # Reglas de fees de la aerolínea que esta subida NO debe recibir (misma transacción).
+            upload_history.record_rule_skips(cur, header.get("airline_id"), tariff_ids, skip_rule_ids)
             # "Reemplazar lo anterior": lo que sustituye esta subida pasa al histórico en la MISMA transacción.
             if replace:
                 pairs = [(ids[r["origin"]], ids[r["destination"]]) for r in rows]
