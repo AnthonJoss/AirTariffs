@@ -18,6 +18,8 @@ office_tms ─► tmsbackendnew (TariffUploadController, solo Admin) ─► AirT
 | `main.py` | API (FastAPI) y middleware `X-Api-Key`. |
 | `tariff_parser.py` | PDF o Excel → texto → LLM (formato compacto, cache en `cache/`) → columnas `n/w45/w100/w300/w500/w1000`. |
 | `excel_reader.py` | Excel (.xlsx/.xlsm) → texto (una fila por línea, celdas con ` \| `): hojas, filas filtradas, tope de caracteres. |
+| `sheet_links.py` | Links: Google Sheet publicado (spots). Registro + primera lectura, Process (preview), **Sync now** (hash del CSV; si cambió inserta el lote nuevo y revierte el anterior), versiones por commodity (DG: +pct % en tarifas y mínimo + regla de fee), historial de revisiones. |
+| `tariff_archive.py` | Histórico: archivar tarifas (`active = 0` + `airtariff_archive`), reemplazar al insertar (`header.replace`), archivar una tanda a mano, consultar y restaurar. |
 | `upload_history.py` | Historial de uploads (lote por archivo) y su reversa: lista, revierte (borra o desactiva) y asocia reglas de fees. |
 | `tier_headers.py` | Lee el encabezado de la tabla (`Min +45 +100 …`) y fija los tramos de peso de cada fila: el modelo a veces inventa un tramo base o corre las columnas. |
 | `versions_ai.py` | Detecta "súbelo también como otro commodity" (mínimo y +USD/kg o %) en términos, instrucciones o documento. |
@@ -62,6 +64,21 @@ ocultas por un filtro se leen siempre** (el filtro es una vista). Tope `TARIFF_E
 (60.000): con hojas por defecto las que no caben se omiten; con hojas elegidas, si no caben es un error.
 Un Excel entra al mismo flujo que el PDF (perfil, términos, cache). Cada petición de `/tariffs/parse` guarda el archivo en su **propia carpeta temporal** (se borra al terminar): varias tarjetas del mismo libro (una por hoja) llegan a la vez con el mismo nombre y compartir la ruta daba `BadZipFile: Truncated file header`. El parser fijo de EgyptAir lee
 líneas de PDF: con un Excel cae al LLM.
+
+## Links (Google Sheet publicado)
+
+`POST /tariffs/links/preview` (qué contiene, sin guardar), `POST /tariffs/links` (registrar + primera
+lectura), `GET /tariffs/links`, `POST /tariffs/links/{id}/sync` (`force`), `POST /tariffs/links/sync-all`,
+`GET /tariffs/links/{id}/tariffs`, `GET /tariffs/links/{id}/runs`, `GET /tariffs/airports?q=`. Formato:
+`UPDATE DATE`, `WK` y la tabla `DEST | tarifa | A/C`. Sin cron ni IA; un Cloud Scheduler podría llamar a
+`sync-all`. Tablas `airtariff_links` y `airtariff_link_runs` (las crea el servicio).
+
+## Histórico y reemplazo
+
+`header.replace` en `/tariffs/insert` ({`mode`: `same_routes | whole_airline | airline_all | batches`,
+`batch_ids`, `any_provider`}). `POST /tariffs/replace/preview` (cuenta, por commodity),
+`POST /tariffs/archive` (tanda o tarifas sueltas; `dry_run`), `GET /tariffs/history?airline_id=`,
+`POST /tariffs/history/restore`. Revertir el lote que reemplazó restaura lo archivado.
 
 ## Reversa de un upload
 

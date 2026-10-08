@@ -15,6 +15,8 @@ import client_terms
 import excel_reader
 import fee_rules_ai
 import gmail_client
+import sheet_links
+import tariff_archive
 import tariff_db
 import tariff_parser
 import upload_history
@@ -235,6 +237,11 @@ async def tariff_companies(q: str, type: int | None = None):
     return await run_in_threadpool(tariff_db.search_companies, q, 15, type)
 
 
+@app.get("/tariffs/airports")
+async def tariff_airports(q: str):
+    return await run_in_threadpool(tariff_db.search_airports, q)
+
+
 @app.get("/tariffs/fees")
 async def tariff_fees():
     return await run_in_threadpool(tariff_db.fees_catalog)
@@ -273,6 +280,144 @@ async def insert_tariffs(body: InsertRequest):
     except ValueError as e:
         raise HTTPException(422, str(e))
     return n
+
+
+# ---------------- Histórico de tarifas (archivar / reemplazar / restaurar) ----------------
+
+def _archive_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except tariff_archive.ArchiveError as e:
+        raise HTTPException(422, str(e))
+
+
+class ReplacePreviewRequest(BaseModel):
+    airline_id: int
+    provider_id: int | None = None
+    commodity_id: int | None = None
+    # Commodity base + los de sus versiones ("también como DG…"): el conteo suma todos
+    commodity_ids: list[int] = []
+    airchaft: int | None = None
+    # {mode: same_routes|whole_airline|airline_all|batches, batch_ids?, any_provider?}
+    replace: dict
+    # [[origen, destino], …] del archivo nuevo (siglas)
+    pairs: list[list[str]] = []
+    run_id: str | None = None
+    batch_id: str | None = None
+
+
+@app.post("/tariffs/replace/preview")
+async def replace_preview(body: ReplacePreviewRequest):
+    """Cuántas tarifas vigentes pasarían al histórico si se sube esto con "reemplazar lo anterior" (no toca nada)."""
+    return await run_in_threadpool(_archive_call, tariff_archive.preview_replace, body.model_dump())
+
+
+class ArchiveRequest(BaseModel):
+    batch_ids: list[str] = []
+    tariff_ids: list[int] = []
+    archived_by: str | None = None
+    dry_run: bool = False
+
+
+@app.post("/tariffs/archive")
+async def archive_tariffs(body: ArchiveRequest):
+    """Pasa al histórico una tanda (lotes) o tarifas sueltas, sin subir nada nuevo."""
+    return await run_in_threadpool(
+        _archive_call, tariff_archive.archive_manual, body.batch_ids, body.tariff_ids, body.archived_by, body.dry_run
+    )
+
+
+@app.get("/tariffs/history")
+async def tariffs_history(airline_id: int, limit: int = 2000):
+    """Histórico de una aerolínea: grupos (qué subida las reemplazó) y tarifas."""
+    return await run_in_threadpool(_archive_call, tariff_archive.history, airline_id, limit)
+
+
+class RestoreRequest(BaseModel):
+    archive_ids: list[int]
+    restored_by: str | None = None
+
+
+@app.post("/tariffs/history/restore")
+async def restore_history(body: RestoreRequest):
+    """Devuelve tarifas del histórico a vigentes."""
+    return await run_in_threadpool(_archive_call, tariff_archive.restore, body.archive_ids, body.restored_by)
+
+
+# ---------------- Links (Google Sheet publicado) ----------------
+
+class LinkRequest(BaseModel):
+    url: str
+    name: str | None = None
+    origin: str
+    provider_id: int
+    airline_id: int
+    commodity_id: int
+    valid_days: int = sheet_links.DEFAULT_VALID_DAYS
+    created_by: str | None = None
+    # Commodities especiales (DG…): [{commodity_id, pct, fee: {fee_id, amount, basis, label}}]
+    versions: list[dict] = []
+
+
+class LinkSyncRequest(BaseModel):
+    # True: vuelve a cargar aunque la hoja no haya cambiado.
+    force: bool = False
+    synced_by: str | None = None
+
+
+def _link_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except sheet_links.LinkNotFound:
+        raise HTTPException(404, "That link is not registered.")
+    except sheet_links.LinkError as e:
+        raise HTTPException(422, str(e))
+
+
+class LinkPreviewRequest(BaseModel):
+    url: str
+
+
+@app.post("/tariffs/links/preview")
+async def preview_link(body: LinkPreviewRequest):
+    """Process: lee la hoja y dice qué contiene (sin guardar nada) para precargar el formulario."""
+    return await run_in_threadpool(_link_call, sheet_links.preview, body.url)
+
+
+@app.get("/tariffs/links")
+async def list_links():
+    return await run_in_threadpool(sheet_links.list_links)
+
+
+@app.post("/tariffs/links")
+async def register_link(body: LinkRequest):
+    """Registra el link y hace la primera lectura (inserta las tarifas)."""
+    return await run_in_threadpool(_link_call, sheet_links.register, body.model_dump(), body.created_by)
+
+
+@app.get("/tariffs/links/{link_id}/tariffs")
+async def link_tariffs(link_id: int):
+    """Las tarifas que hoy tiene el link (para seguirlas en la pestaña Links)."""
+    return await run_in_threadpool(_link_call, sheet_links.link_tariffs, link_id)
+
+
+@app.get("/tariffs/links/{link_id}/runs")
+async def link_runs(link_id: int, limit: int = 30):
+    """Historial de revisiones del link (actualizó / sin cambios / error)."""
+    return await run_in_threadpool(_link_call, sheet_links.link_runs, link_id, limit)
+
+
+@app.post("/tariffs/links/sync-all")
+async def sync_all_links():
+    """Revisa todos los links; solo actualiza los que cambiaron."""
+    return await run_in_threadpool(sheet_links.sync_all)
+
+
+@app.post("/tariffs/links/{link_id}/sync")
+async def sync_link(link_id: int, body: LinkSyncRequest | None = None):
+    """Sync now: baja la hoja y, si cambió (o `force`), reemplaza las tarifas del link."""
+    body = body or LinkSyncRequest()
+    return await run_in_threadpool(_link_call, sheet_links.sync, link_id, body.force, body.synced_by)
 
 
 # ---------------- Historial de uploads y reversa ----------------

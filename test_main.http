@@ -182,3 +182,41 @@ Content-Type: application/json
 
 {"batch_ids": ["<batch_id>"], "dry_run": true,
  "changes": {"adjust": [{"target": "rates", "op": "pct", "value": 40}, {"target": "min", "op": "add", "value": 10}]}}
+
+### Links: registrar un Google Sheet publicado (primera lectura)
+POST http://localhost:8001/tariffs/links
+Content-Type: application/json
+
+{"url": "https://docs.google.com/spreadsheets/d/e/<id>/pubhtml", "name": "Weekly spots", "origin": "MIA",
+ "provider_id": 0, "airline_id": 0, "commodity_id": 88, "valid_days": 7}
+
+### Links: listar
+GET http://localhost:8001/tariffs/links
+
+### Links: Sync now (solo recarga si la hoja cambió; "force": true recarga igual)
+POST http://localhost:8001/tariffs/links/1/sync
+Content-Type: application/json
+
+{"force": false}
+
+### Histórico: cuántas tarifas pasarían al histórico (no toca nada)
+POST http://localhost:8001/tariffs/replace/preview
+Content-Type: application/json
+
+{"airline_id": 0, "provider_id": 0, "commodity_id": 88, "airchaft": 2,
+ "replace": {"mode": "same_routes"}, "pairs": [["MIA", "BOG"]]}
+
+### Histórico: pasar una tanda (lotes) a mano; "dry_run": true solo cuenta
+POST http://localhost:8001/tariffs/archive
+Content-Type: application/json
+
+{"batch_ids": ["<batch_id>"], "dry_run": true}
+
+### Histórico de una aerolínea
+GET http://localhost:8001/tariffs/history?airline_id=0
+
+### Restaurar del histórico (archive_id de /tariffs/history)
+POST http://localhost:8001/tariffs/history/restore
+Content-Type: application/json
+
+{"archive_ids": [1]}

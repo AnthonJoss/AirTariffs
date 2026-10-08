@@ -21,6 +21,7 @@ from datetime import datetime
 
 import mysql.connector
 
+import tariff_archive
 from db_conn import db_conn
 
 PROFILE = os.getenv("MYSQL_PROFILE", "local")
@@ -266,6 +267,18 @@ def _used_tariff_ids(cur, ids: list[int]) -> set[int]:
     return used
 
 
+def _count_replaced(cur, batch_id: str) -> int:
+    try:
+        cur.execute(
+            "SELECT COUNT(*) FROM airtariff_archive WHERE replaced_by_batch = %s AND restored_at IS NULL", (batch_id,)
+        )
+        return int(cur.fetchone()[0])
+    except mysql.connector.errors.ProgrammingError as e:
+        if e.errno == MISSING_TABLE:
+            return 0
+        raise
+
+
 def revert_batch(batch_id: str, reverted_by: str | None = None, dry_run: bool = False) -> dict:
     """Revierte un lote. Con dry_run solo cuenta lo que pasaría, sin tocar nada."""
     ensure_table()
@@ -322,6 +335,8 @@ def revert_batch(batch_id: str, reverted_by: str | None = None, dry_run: bool = 
             "deleted_rules": len(rules_existing),
             # Para que el office las quite de su lista de reglas.
             "rule_ids": rules_existing,
+            # Tarifas que este lote mandó al histórico (al reemplazarlas): vuelven a estar vigentes.
+            "restored_from_history": _count_replaced(cur, batch_id),
         }
         if dry_run:
             return result
@@ -335,6 +350,7 @@ def revert_batch(batch_id: str, reverted_by: str | None = None, dry_run: bool = 
                 cur.execute(f"UPDATE tariffs SET active = 0, updated_at = NOW() WHERE id IN ({_marks(len(chunk))})", chunk)
             if rules_existing:
                 cur.execute(f"DELETE FROM air_fee_rules WHERE id IN ({_marks(len(rules_existing))})", rules_existing)
+            result["restored_from_history"] = tariff_archive.restore_by_replacer(cur, batch_id, reverted_by)
             cur.execute(
                 f"UPDATE airtariff_uploads SET status = 'reverted', reverted_at = NOW(), reverted_by = %s, "
                 f"deleted_tariffs = 0, deactivated_tariffs = 0, deleted_rules = 0 "

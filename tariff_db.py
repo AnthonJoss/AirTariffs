@@ -5,6 +5,7 @@ import os
 
 import mysql.connector
 
+import tariff_archive
 import upload_history
 from db_conn import db_conn
 
@@ -28,6 +29,20 @@ def search_companies(q: str, limit: int = 15, type_id: int | None = None):
     with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return [{"id": i, "name": n} for i, n in cur.fetchall()]
+
+
+def search_airports(q: str, limit: int = 15):
+    """Aeropuertos (transports.type_id = 1) por código o nombre; los que empiezan por el texto van primero."""
+    q = (q or "").strip()
+    if not q:
+        return []
+    with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, codigo, fullname FROM transports WHERE type_id = 1 AND (codigo LIKE %s OR fullname LIKE %s) "
+            "ORDER BY (codigo = %s) DESC, (codigo LIKE %s) DESC, fullname LIMIT %s",
+            (f"{q}%", f"%{q}%", q.upper(), f"{q}%", limit),
+        )
+        return [{"id": i, "code": (c or "").upper(), "name": n} for i, c, n in cur.fetchall()]
 
 
 def company_names(ids) -> dict[int, str]:
@@ -222,7 +237,11 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
     fees = header.get("fees") or []
     fuel_fee_id = header.get("fuel_fee_id")
     upload_history.ensure_table()  # antes de la transaccion: un CREATE TABLE haria commit implicito
+    replace = tariff_archive.clean_spec(header.get("replace"))  # valida antes de insertar nada
+    if replace:
+        tariff_archive.ensure_table()
     fee_count = 0
+    archived = 0
     tariff_ids: list[int] = []
     with db_conn(PROFILE, pooled=False) as conn:
         cur = conn.cursor()
@@ -243,10 +262,17 @@ def insert_tariffs(header: dict, rows: list[dict]) -> dict:
                     fee_count += 1
             # Historial del upload (para poder revertirlo) en la MISMA transaccion: o entra todo o nada.
             batch_id = upload_history.record_upload(cur, header, tariff_ids, fee_count)
+            # "Reemplazar lo anterior": lo que sustituye esta subida pasa al histórico en la MISMA transacción.
+            if replace:
+                pairs = [(ids[r["origin"]], ids[r["destination"]]) for r in rows]
+                archived = tariff_archive.archive_for_replace(cur, header, replace, tariff_ids, pairs, batch_id)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         finally:
             cur.close()
-    return {"tariffs": len(data), "fees": fee_count, "batch_id": batch_id, "tracked": batch_id is not None}
+    return {
+        "tariffs": len(data), "fees": fee_count, "batch_id": batch_id, "tracked": batch_id is not None,
+        "archived": archived,
+    }
