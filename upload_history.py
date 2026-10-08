@@ -127,6 +127,55 @@ class AlreadyReverted(ValueError):
     pass
 
 
+def clean_skip_rule_ids(raw) -> list[int]:
+    """`header.skip_rule_ids`: ids de `air_fee_rules` que la subida no debe recibir. Valida el tipo."""
+    if raw in (None, "", []):
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("skip_rule_ids must be a list of rule ids")
+    try:
+        return sorted({int(i) for i in raw})
+    except (TypeError, ValueError) as e:
+        raise ValueError("skip_rule_ids must be a list of rule ids") from e
+
+
+def record_rule_skips(cur, airline_id, tariff_ids: list[int], rule_ids: list[int]) -> int:
+    """Guarda (tariff_id, rule_id) en `air_fee_rule_skips` (la crea el backend) DENTRO de la transaccion.
+
+    Solo acepta reglas de la aerolinea de la subida. Si la tabla no existe se aborta: el upload no debe
+    entrar con las reglas que el usuario pidio quitar.
+    """
+    if not rule_ids or not tariff_ids:
+        return 0
+    try:
+        cur.execute(
+            f"SELECT id FROM air_fee_rules WHERE airline_id = %s AND id IN ({_marks(len(rule_ids))})",
+            [airline_id, *rule_ids],
+        )
+        valid = sorted(r[0] for r in cur.fetchall())
+        if len(valid) != len(rule_ids):
+            bad = sorted(set(rule_ids) - set(valid))
+            raise ValueError(f"skip_rule_ids: rules {bad} do not exist or belong to another airline")
+        pairs = [(t, r) for t in tariff_ids for r in valid]
+        for chunk in _chunks(pairs):
+            cur.executemany("INSERT IGNORE INTO air_fee_rule_skips (tariff_id, rule_id) VALUES (%s, %s)", chunk)
+    except mysql.connector.errors.ProgrammingError as e:
+        if e.errno == MISSING_TABLE:
+            raise ValueError("The air_fee_rule_skips table does not exist: run the backend migration first.") from e
+        raise
+    return len(pairs)
+
+
+def _delete_rule_skips(cur, tariff_ids: list[int]) -> None:
+    """Quita las exclusiones de tarifas que se borran. Tolera que la tabla aun no exista."""
+    try:
+        for chunk in _chunks(tariff_ids):
+            cur.execute(f"DELETE FROM air_fee_rule_skips WHERE tariff_id IN ({_marks(len(chunk))})", chunk)
+    except mysql.connector.errors.ProgrammingError as e:
+        if e.errno != MISSING_TABLE:
+            raise
+
+
 def _chunks(items: list, size: int = CHUNK):
     for i in range(0, len(items), size):
         yield items[i : i + size]
@@ -344,6 +393,7 @@ def revert_batch(batch_id: str, reverted_by: str | None = None, dry_run: bool = 
         try:
             for chunk in _chunks(to_delete):
                 cur.execute(f"DELETE FROM tariff_feeds WHERE tariff_id IN ({_marks(len(chunk))})", chunk)
+                _delete_rule_skips(cur, chunk)
                 cur.execute(f"DELETE FROM tariffs WHERE type_tariff = %s AND id IN ({_marks(len(chunk))})",
                             [TYPE_TARIFF_AIR, *chunk])
             for chunk in _chunks(to_deactivate):
