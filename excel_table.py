@@ -98,7 +98,7 @@ def _find_header(rows: list[list]) -> tuple[int, int, list[int]] | None:
     for i, row in enumerate(rows):
         cells = [_s(c) for c in row]
         for j, c in enumerate(cells):
-            if not tier_headers._MIN.match(c.lower() if c else ""):
+            if not tier_headers.is_min(c):
                 continue
             tiers: list[int] = []
             for nxt in cells[j + 1 :]:
@@ -106,7 +106,7 @@ def _find_header(rows: list[list]) -> tuple[int, int, list[int]] | None:
                 if v is None:
                     break
                 tiers.append(v)
-            if len(tiers) >= 2 and tiers == sorted(tiers):
+            if len(tiers) >= 2 and all(a < b for a, b in zip(tiers, tiers[1:])):
                 return i, j, tiers
     return None
 

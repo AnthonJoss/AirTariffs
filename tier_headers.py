@@ -8,25 +8,47 @@ coinciden y la fila trae tantos tramos como columnas; si no, se deja lo del mode
 """
 import re
 
-_MIN = re.compile(r"^min(imum|imu|\.)?$", re.I)
 _SPLIT = re.compile(r"\s*\|\s*|\s+")
+
+# Unidades y palabras de relleno que acompañan a los encabezados: "Minimum USD", "+100 USD/kg", "100 kg+", "Min charge".
+_UNITS = re.compile(
+    r"(?i)(?:us\$|usd|eur|gbp|cad|mxn|[$€£]|per\s*kgs?|/\s*kgs?|\bkgs?\b|(?<=\d)kgs?|\blbs?\b|\brates?\b|\bcharges?\b|\bcargo\b"
+    r"|\btarifa\b|\bflat\b|\bper\s*shipment\b|\(|\)|\*)"
+)
+# Solo variantes inequívocas de "mínimo": nada de "M"/"MC" sueltas, que chocan con cualquier columna.
+_MIN = re.compile(r"^(min(imum|imu|\.)?|m[ií]n(imo|\.)?)$", re.I)
+
+
+def _clean(token: str) -> str:
+    """Encabezado sin unidades ni relleno, en minúsculas: "+100 USD/kg" -> "+100", "Minimum USD" -> "minimum"."""
+    return " ".join(_UNITS.sub(" ", token.lower().replace("\n", " ")).split())
+
+
+def is_min(token: str) -> bool:
+    """¿Es el encabezado de la tarifa mínima? (Min, Minimum, Minimum USD, Min. charge, Mínimo)."""
+    return bool(token) and bool(_MIN.match(_clean(token)))
 
 
 def _tier(token: str) -> int | None:
     """`from_kg` de un encabezado de tramo; None si no es un tramo."""
-    t = token.strip().lower().replace("kgs", "").replace("kg", "").strip()
+    t = _clean(token).replace(" ", "")
     if t in ("n", "normal", "base"):
         return 0
-    m = re.fullmatch(r"\+\s*(\d{1,5})k?", t)
+    m = re.fullmatch(r"(?:\+|>=?|≥|over|above|from|desde|q)(\d{1,5})k?\+?", t)  # "+100", ">100", "Q100"
     if m:
         return int(m.group(1))
-    if re.fullmatch(r"[-<≤]\s*=?\s*\d{1,5}k?", t):  # "-100", "<100": desde 0 kg
+    m = re.fullmatch(r"(\d{1,5})k?\+", t)  # "100+", "45k+"
+    if m:
+        return int(m.group(1))
+    if re.fullmatch(r"(?:-|<=?|≤|under|below|hasta)(\d{1,5})k?", t):  # "-100", "<100": desde 0 kg
         return 0
+    m = re.fullmatch(r"(\d{1,5})k?[-–—](\d{1,5})k?", t)  # rango "45-99", "100-299": desde el primero
+    if m:  # el rango tiene que ser creciente
+        return int(m.group(1)) if int(m.group(2)) > int(m.group(1)) else None
     m = re.fullmatch(r"(\d{1,5})k", t)  # "1k" = tramo base; "45k" = 45 kg
     if m:
         return 0 if int(m.group(1)) == 1 else int(m.group(1))
-    m = re.fullmatch(r"\d{2,5}", t)  # "45", "100"
-    return int(t) if m else None
+    return int(t) if re.fullmatch(r"\d{2,5}", t) else None  # "45", "100"
 
 
 def detect(text: str) -> list[int] | None:
@@ -36,15 +58,17 @@ def detect(text: str) -> list[int] | None:
         line = re.sub(r"(?i)\bminimu\s+m\b", "minimum", line)  # celdas partidas: "Minimu | m"
         tokens = [t for t in _SPLIT.split(line.strip()) if t]
         for i, tok in enumerate(tokens):
-            if not _MIN.match(tok):
+            if not is_min(tok):
                 continue
             tiers: list[int] = []
             for nxt in tokens[i + 1 :]:
+                if not _clean(nxt):  # solo unidad ("USD/kg", "kg"): no corta la serie de tramos
+                    continue
                 v = _tier(nxt)
                 if v is None:
                     break
                 tiers.append(v)
-            if len(tiers) >= 2 and tiers == sorted(tiers):
+            if len(tiers) >= 2 and all(a < b for a, b in zip(tiers, tiers[1:])):
                 found.add(tuple(tiers))
             break  # una cabecera por línea
     return list(next(iter(found))) if len(found) == 1 else None
