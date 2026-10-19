@@ -31,6 +31,10 @@ def is_min(token: str) -> bool:
 
 def _tier(token: str) -> int | None:
     """`from_kg` de un encabezado de tramo; None si no es un tramo."""
+    # "1Kg" / "1 kg": la tarifa base (N, hasta el primer quiebre). Con la unidad pegada no es "1k" ni un tramo de
+    # 1 kg real: IAG Cargo y otros libros encabezan asi `Min | 1Kg | 45Kg | 100Kg | 300Kg | 500Kg`.
+    if re.fullmatch(r"(?i)\s*1\s*kgs?\s*", token):
+        return 0
     t = _clean(token).replace(" ", "")
     if t in ("n", "normal", "base"):
         return 0
