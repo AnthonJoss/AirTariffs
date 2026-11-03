@@ -217,6 +217,49 @@ def preview_replace(body: dict) -> dict:
         return out
 
 
+def live_duplicates(body: dict) -> dict:
+    """Tarifas vigentes (active = 1 y f_end >= hoy) que ya existen en las mismas rutas, commodity y avión de lo que
+    se va a subir, de CUALQUIER proveedor de la aerolínea. Es solo un aviso de duplicado: no toca nada."""
+    from tariff_db import transport_ids  # import local: tariff_db importa este módulo
+
+    try:
+        ctx = {"airline_id": int(body["airline_id"]), "provider_id": int(body.get("provider_id") or 0),
+               "airchaft": int(body.get("airchaft") or 2)}
+    except (KeyError, TypeError, ValueError):
+        raise ArchiveError("airline_id is required.") from None
+    ids = transport_ids(sorted({c for p in body.get("pairs") or [] for c in p if c}))
+    pairs = [(ids[o], ids[d]) for o, d in (body.get("pairs") or []) if o in ids and d in ids]
+    commodity_ids = [int(c) for c in (body.get("commodity_ids") or []) if c] or (
+        [int(body["commodity_id"])] if body.get("commodity_id") else []
+    )
+    empty = {"total": 0, "routes_with_duplicates": 0, "other_provider": 0, "uploads": [], "routes": []}
+    if not pairs or not commodity_ids:
+        return empty
+    spec = {"mode": "same_routes", "any_provider": True, "batch_ids": []}
+    with db_conn(PROFILE, pooled=False) as conn, conn.cursor() as cur:
+        keep = _run_ids(cur, body.get("run_id"), body.get("batch_id"), [])
+        found: set[int] = set()
+        for cid in dict.fromkeys(commodity_ids):
+            found |= set(find_targets(cur, {**ctx, "commodity_id": cid}, spec, pairs, keep))
+        live: list[int] = []
+        other_provider = 0
+        pair_set: set[tuple[int, int]] = set()
+        for chunk in _chunks(sorted(found)):
+            cur.execute(
+                "SELECT id, provider_id, origin_id, destin_id FROM tariffs "
+                f"WHERE f_end >= NOW() AND id IN ({_marks(len(chunk))})",
+                chunk,
+            )
+            for tid, prov, o, d in cur.fetchall():
+                live.append(tid)
+                pair_set.add((o, d))
+                other_provider += 1 if prov != ctx["provider_id"] else 0
+        out = _summary(cur, sorted(live))
+        out["routes_with_duplicates"] = len(pair_set)
+        out["other_provider"] = other_provider
+        return out
+
+
 def _summary(cur, ids: list[int]) -> dict:
     """Resumen de un conjunto de tarifas: por subida de origen y por ruta (ejemplos)."""
     uploads: dict[str, dict] = {}
