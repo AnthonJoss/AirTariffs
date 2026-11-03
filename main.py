@@ -312,6 +312,23 @@ async def replace_preview(body: ReplacePreviewRequest):
     return await run_in_threadpool(_archive_call, tariff_archive.preview_replace, body.model_dump())
 
 
+class DuplicatesRequest(BaseModel):
+    airline_id: int
+    provider_id: int | None = None
+    commodity_id: int | None = None
+    commodity_ids: list[int] = []
+    airchaft: int | None = None
+    pairs: list[list[str]] = []
+    run_id: str | None = None
+    batch_id: str | None = None
+
+
+@app.post("/tariffs/duplicates")
+async def tariff_duplicates(body: DuplicatesRequest):
+    """Aviso de duplicado: cuántas tarifas vigentes ya existen en las rutas del archivo (cualquier proveedor). No toca nada."""
+    return await run_in_threadpool(_archive_call, tariff_archive.live_duplicates, body.model_dump())
+
+
 class ArchiveRequest(BaseModel):
     batch_ids: list[str] = []
     tariff_ids: list[int] = []
